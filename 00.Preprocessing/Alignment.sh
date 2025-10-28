@@ -162,4 +162,165 @@ cellranger count \
 --create-bam=true \
 --expect-cells 9000
 
+# Tyser et al., 2020
+module load singularity-ce/
+fastpimg=$HOME/software/singularity/fastp_v0.23.4.sif
+starimg=$HOME/software/singularity/star_2.7.11b.sif
+
+cd $HOME/Data/scRNA/E-MTAB-9388_Tyser_Gastrula
+
+mkdir -p fastq/trim
+mkdir -p fastq/fastp
+mkdir -p count
+
+cd $HOME/Data/scRNA/E-MTAB-9388_Tyser_Gastrula/fastq
+
+cat SRR_list.txt | while read srr; do
+   singularity exec $fastpimg fastp \
+       -i raw/${srr}_1.fastq.gz \
+       -I raw/${srr}_2.fastq.gz \
+       -o trim/${srr}_1_trim.fastq.gz \
+       -O trim/${srr}_2_trim.fastq.gz \
+       --adapter_sequence=AAGCAGTGGTATCAACGCAGAGTAC \
+       --adapter_sequence_r2=AAGCAGTGGTATCAACGCAGAGTAC \
+       --poly_x_min_len=10 \
+       --trim_poly_g \
+       --trim_poly_x \
+       --length_required=20 \
+       --qualified_quality_phred=20 \
+       --unqualified_percent_limit=40 \
+       --average_qual=20 \
+       --n_base_limit=5 \
+       --overrepresentation_analysis \
+       --json=fastp/${srr}_fastp.json \
+       --html=fastp/${srr}_fastp.html \
+       --report_title="smart-seq2 FastP Report" \
+       --thread=16
+done
+
+cd $HOME/Data/scRNA/E-MTAB-9388_Tyser_Gastrula
+
+singularity exec $starimg STAR --runThreadN 48 \
+     --genomeDir $HOME/Reference/scRNA/2024-A/GRCh38/star_2.7.11b \
+     --readFilesCommand zcat \
+     --outFileNamePrefix count/ \
+     --soloType SmartSeq \
+     --soloFeatures GeneFull_Ex50pAS \
+     --readFilesManifest manifest.tsv \
+     --soloUMIdedup Exact NoDedup \
+     --soloStrand Unstranded \
+     --outSAMtype BAM SortedByCoordinate \
+     --outBAMsortingBinsN 200
+
+# Zeng et al., 2023
+cd $HOME/Data/scRNA/GSE155121_Zeng_Embryo
+
+mkdir -p temp_fq
+mkdir -p count
+
+cat SRR_list.txt | while read srr; do
+   cd $HOME/Data/scRNA/GSE155121_Zeng_Embryo
+   
+   fasterq-dump -p -e 60 fastq/raw/${srr}/${srr}.sralite -O fastq/raw
+   
+   pigz -p 60 -f fastq/raw/${srr}_1.fastq
+   pigz -p 60 -f fastq/raw/${srr}_2.fastq
+   
+   rm -rf temp_fq/*
+   
+   mv fastq/raw/${srr}_1.fastq.gz temp_fq/${srr}_S1_L001_R1_001.fastq.gz
+   mv fastq/raw/${srr}_2.fastq.gz temp_fq/${srr}_S1_L001_R2_001.fastq.gz
+   
+   cd count
+   
+   cellranger count \
+     --id ${srr} \
+     --transcriptome $HOME/Reference/scRNA/2024-A/GRCh38 \
+     --fastqs ../temp_fq/ \
+     --sample ${srr} \
+     --create-bam=false
+done
+
+# Xu et al., 2023
+cd $HOME/Data/scRNA/GSE157329_Xu_Embryo
+
+mkdir -p temp_fq
+rm -rf temp_fq/*
+mkdir -p count
+
+cat Sample_list.txt | while read sample; do
+   ls -1 fastq/$sample | grep SRR | while read srr; do
+      echo "Sample: $sample | File: $srr"
+      
+      fasterq-dump -e 100 fastq/$sample/$srr/$srr.sralite -O temp_fq
+      
+      pigz -p 100 -f temp_fq/${srr}_1.fastq
+      pigz -p 100 -f temp_fq/${srr}_2.fastq
+      
+      mv temp_fq/${srr}_1.fastq.gz temp_fq/${srr}_S1_L001_R1_001.fastq.gz
+      mv temp_fq/${srr}_2.fastq.gz temp_fq/${srr}_S1_L001_R2_001.fastq.gz
+      
+   done
+   
+   srrs=$(ls -1 fastq/$sample | paste -s -d ',')
+   
+   cd count
+   
+   cellranger count \
+     --id $sample \
+     --transcriptome $HOME/Reference/scRNA/2024-A/GRCh38 \
+     --fastqs ../temp_fq/ \
+     --sample $srrs \
+     --create-bam=false
+   
+   cd ../
+   
+   if [[ -f count/$sample/outs/web_summary.html ]]; then
+     rm -r temp_fq/*
+   fi
+   
+done
+
+# Rayon et al., 2021
+cd $HOME/Data/scRNA/GSE171892_Rayon_SpinalCord
+
+mkdir -p temp_fq
+rm -rf temp_fq/*
+mkdir -p count
+
+cat Sample_list.txt | while read sample; do
+   ls -1 fastq/$sample | grep SRR | while read srr; do
+      echo "Sample: $sample | File: $srr"
+      
+      fasterq-dump -e 100 fastq/$sample/$srr/$srr.sralite -O temp_fq
+      
+      pigz -p 100 -f temp_fq/${srr}_1.fastq
+      pigz -p 100 -f temp_fq/${srr}_2.fastq
+      
+      mv temp_fq/${srr}_1.fastq.gz temp_fq/${srr}_S1_L001_R1_001.fastq.gz
+      mv temp_fq/${srr}_2.fastq.gz temp_fq/${srr}_S1_L001_R2_001.fastq.gz
+      
+   done
+   
+   srrs=$(ls -1 fastq/$sample | paste -s -d ',')
+   
+   cd count
+   
+   cellranger count \
+     --id $sample \
+     --transcriptome $HOME/Reference/scRNA/2024-A/GRCh38 \
+     --fastqs ../temp_fq/ \
+     --sample $srrs \
+     --create-bam=false
+   
+   cd ../
+   
+   if [[ -f count/$sample/outs/web_summary.html ]]; then
+     rm -r temp_fq/*
+   fi
+   
+done
+
+
+
 
