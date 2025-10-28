@@ -1,0 +1,410 @@
+---
+title: "Hhi treat"
+output: html_notebook
+---
+
+# Library
+```{r}
+library(tidyverse)
+library(data.table)
+library(lemon)
+library(Seurat)
+library(SeuratWrappers)
+library(ggsci)
+library(viridis)
+library(RColorBrewer)
+library(scCustomize)
+library(scales)
+library(directlabels)
+library(clusterProfiler)
+library(patchwork)
+library(Matrix)
+library(Hmisc)
+library(tidyplots)
+library(scales)
+library(ggalluvial)
+library(destiny)
+
+"%not.in%" <- Negate("%in%")
+
+mypal <- c(pal_jco("default")(10),
+           pal_startrek("uniform")(7),
+           pal_flatui("default")(10),
+           pal_frontiers("default")(10),
+           pal_cosmic("hallmarks_light")(10),
+           pal_npg("nrc")(10),
+           pal_aaas("default")(10),
+           pal_nejm("default")(8),
+           pal_lancet("lanonc")(9),
+           pal_ucscgb("default")(26),
+           pal_d3("category20")(20),
+           pal_observable("observable10")(10),
+           pal_igv("default")(51),
+           pal_rickandmorty("schwifty")(12)) %>% unlist() %>% unique()
+```
+
+# Load data
+```{r}
+hhi <- readRDS("/Users/asekiya/Desktop/Dry/Running/7_EmbryoModel/scRNA-seq/Result_v13/RDS/D9.Hhi.rds")
+hhi[["RNA"]] <- split(hhi[["RNA"]], f = hhi$batch)
+```
+
+# Normalization ~ PCA
+```{r}
+hhi <- NormalizeData(hhi)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+hhi.cc <- JoinLayers(hhi)
+hhi.cc <- CellCycleScoring(hhi.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = hhi.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(hhi.cc)
+
+hhi <- AddMetaData(hhi, metadata = cc.score)
+
+hhi <- FindVariableFeatures(hhi,nfeatures = 3000)
+hhi <- ScaleData(hhi, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+hhi <- RunPCA(hhi)
+```
+
+# Harmony integration
+```{r}
+set.seed(0)
+hhi.i <- IntegrateLayers(
+  object = hhi, method = HarmonyIntegration, assay = "RNA", theta=1,
+  orig.reduction = "pca", new.reduction = "harmony", verbose = FALSE)
+```
+
+```{r}
+dim <- 50
+k <- 30
+mind <- 0.4
+
+hhi.i <- RunUMAP(hhi.i,
+                  dims = 1:dim, 
+                  reduction = "harmony",
+                  reduction.name = "umap.harmony", 
+                  n.neighbors = k,
+                  min.dist = mind, 
+                  spread=0.5,
+                  metric = "manhattan")
+```
+
+# Clustering
+```{r}
+hhi.i <- FindNeighbors(hhi.i, reduction = "harmony", dims = 1:50, k.param = 10, nn.method = "annoy", annoy.metric = "manhattan")
+hhi.i <- FindClusters(hhi.i, resolution = 0.5, cluster.name = "harmony_clusters")
+```
+
+# Marker genes
+```{r}
+hhi.i <- JoinLayers(hhi.i)
+markers <- FindAllMarkers(hhi.i, only.pos = TRUE)
+
+markers %>% 
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  top_n(p_val_adj,n=-20)
+
+markers %>% 
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  filter(p_val_adj < 0.05) %>% 
+  write_tsv("Hhi/Merged_Cluster_Markers.txt")
+
+```
+
+# Annotation
+```{r}
+anno <- read_tsv("Hhi/Merged_Cluster_Annotation.txt")
+
+meta <- tibble(cells=Cells(hhi.i),harmony_clusters=hhi.i$harmony_clusters) %>% 
+  left_join(anno) %>%
+  column_to_rownames("cells")
+
+hhi.i <- hhi.i %>% AddMetaData(metadata = meta)
+```
+
+# Plot
+## Annotation
+```{r}
+g <- bind_cols(hhi.i@meta.data,hhi.i@reductions$umap.harmony@cell.embeddings) %>% 
+  mutate(Annotation.Broad=fct_relevel(as_factor(Annotation.Broad),c("Endoderm","Mesoderm","Mesothelium","Cardiomyocyte","Endothelium","Neural progenitor","Neuron","Neural crest"))) %>%
+  sample_frac(1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,color=Annotation.Broad))
+
+p <- g + 
+  geom_point(shape=16,size=2) + 
+  facet_rep_grid(.~batch,repeat.tick.labels=F) + 
+  theme_void() +
+  scale_color_manual(values=mypal[50:length(mypal)]) +
+  theme(
+      legend.position = "none",
+      aspect.ratio = 1,
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      strip.text = element_blank(),
+      strip.background = element_blank()
+      )
+p
+
+ggsave(plot=p, 
+       filename=paste0("Hhi/Merged.annot.broad.split.png"),
+       width=5, height=5, limitsize = FALSE)
+```
+
+```{r}
+dat <- hhi.i@meta.data %>% as_tibble() %>% 
+  group_by(batch,Annotation.Broad) %>% 
+  summarise(Count=n()) %>% 
+  ungroup() %>% 
+  mutate(Annotation.Broad=fct_relevel(as_factor(Annotation.Broad),c("Endoderm","Mesoderm","Mesothelium","Cardiomyocyte","Endothelium","Neural progenitor","Neuron","Neural crest"))) %>% 
+  mutate(batch=fct_relevel(as_factor(batch),c("day9-hhi","day9"))) %>% 
+  arrange(batch,Annotation.Broad) %>% 
+  group_by(batch) %>% 
+  mutate(Percent=Count/sum(Count)) %>% 
+  ungroup()
+
+g <- dat %>% 
+  ggplot(aes(x=batch,y=Percent))
+p <- g + 
+  geom_flow(aes(alluvium = Annotation.Broad),
+            alpha= .9, 
+            lty = 2, fill = "white", color = "black",
+            curve_type = "linear", 
+            width = .5) +
+  geom_col(aes(fill = Annotation.Broad), width = .5, color = "black") +
+  scale_fill_manual(values=mypal[50:length(mypal)]) +
+  scale_y_reverse(expand = c(0,0)) + 
+  theme_classic() + 
+  theme(
+    panel.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour="black"),
+    axis.line.y = element_blank(),
+    axis.title.y = element_text(size=15),
+    axis.title.x = element_blank(),
+    axis.text = element_text(colour="black"),
+    aspect.ratio = 1/4,
+    legend.position = "none"
+  ) + 
+  coord_flip()
+p
+
+ggsave(plot=p, filename="Hhi/Anno.broad.Percent.svg",
+       width=10, height=2, limitsize = FALSE)
+```
+
+# Neural lineage
+```{r}
+np <- hhi.i %>% subset(subset = Annotation.Broad %in% c("Neural progenitor","Neuron","Neural crest"))
+```
+
+## batch
+```{r}
+g <- bind_cols(np@meta.data,np@reductions$umap.harmony@cell.embeddings) %>% 
+  sample_frac(1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,color=batch))
+
+p <- g + 
+  geom_point(shape=16,size=3) + 
+  theme_void() +
+  scale_color_manual(values=c("#219ebc","#fb8500")) +
+  theme(
+      legend.position = "none",
+      aspect.ratio = 1,
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      strip.text = element_blank(),
+      strip.background = element_blank()
+      )
+p
+
+ggsave(plot=p, 
+       filename=paste0("Hhi/Merged.Neural.batch.png"),
+       width=4, height=4, limitsize = FALSE)
+```
+
+## Annotation
+```{r}
+g <- bind_cols(np@meta.data,np@reductions$umap.harmony@cell.embeddings) %>% 
+  sample_frac(1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,color=Annotation))
+
+p <- g + 
+  geom_point(shape=16,size=3) + 
+  theme_void() +
+  scale_color_manual(values=mypal[66:length(mypal)]) +
+  theme(
+      legend.position = "none",
+      aspect.ratio = 1,
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      strip.text = element_blank(),
+      strip.background = element_blank()
+      )
+p
+
+ggsave(plot=p, 
+       filename=paste0("Hhi/Merged.Neuro.annot.png"),
+       width=4, height=4, limitsize = FALSE)
+```
+
+## Feature plot
+```{r}
+genes <- c("SOX2","RFX4","LMX1A","MSX1","MSX2","PAX3","WNT1",
+           "IRX3","IRX5","OLIG3","PAX6","ASCL1","GBX2","GSX2","PAX7","GSX1",
+           "DBX2","DBX1","SP8","NKX6-2","PRDM12","FOXN4","NKX6-1","OLIG2","NKX2-2","NKX2-6",
+           "ARX","FERD3L","FOXA2","LMX1B","SHH",
+           "MYT1L","STMN2","ELAVL3","MAP2",
+           "SOX10","MPZ","FOXD3",
+           "NEUROD1","SIX1","NEUROG1","PRDM12") %>% 
+  unique()
+
+pal <- rev(viridis_pal(option="rocket")(15)[6:15])
+
+for(i in 1:length(genes)){
+  mark <- genes[i]
+  p <- FeaturePlot_scCustom(seurat_object = np, num_columns = 1,
+                            features = genes[i], colors_use = pal, na_color = "grey90",
+                            reduction = "umap.harmony", order=TRUE, pt.size = 3) & 
+    theme_void() & 
+    theme(
+      legend.position = "none",
+      aspect.ratio = 1,
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      plot.title = element_blank(),
+      )
+  
+  ggsave(plot=p, 
+         filename=paste0("Hhi/Neural.Features/",i,"_",mark,".png"),
+         width=4, height=4, limitsize = FALSE)
+}
+```
+
+# Pseudoaxis
+```{r}
+np <- hhi.i %>% subset(subset = Annotation.Broad %in% c("Neural progenitor"))
+```
+
+```{r}
+harmony <- np@reductions$harmony@cell.embeddings
+```
+
+## Diffusion map
+```{r}
+dm <- DiffusionMap(as.matrix(harmony[,1:30]),k=40,n_pcs=NA)
+
+tmp <- data.frame(DC1 = eigenvectors(dm)[, 1],
+                  DC2 = eigenvectors(dm)[, 2],
+                  Labels = np$batch)
+tmp <- tmp %>% mutate(Cells=rownames(tmp),No=row_number())
+```
+
+```{r}
+dc <- tibble(Cells=Cells(np)) %>% 
+  left_join(tmp) %>% 
+  select(Cells,DC1) %>% 
+  column_to_rownames("Cells")
+
+np <- np %>% AddMetaData(metadata = dc)
+```
+
+## Plot
+### Density (Expression)
+```{r}
+genes <- c("SOX2","RFX4","LMX1A","MSX1","MSX2","PAX3","WNT1",
+           "IRX3","IRX5","OLIG3","PAX6","ASCL1","GBX2","GSX2","PAX7","GSX1",
+           "DBX2","DBX1","SP8","NKX6-2","PRDM12","FOXN4","NKX6-1","OLIG2","NKX2-2","NKX2-6",
+           "ARX","FERD3L","FOXA2","LMX1B","SHH") %>% 
+  unique()
+
+dat <- bind_cols(FetchData(object = np, vars = genes, layer = "data"),
+                 np@meta.data %>% select(batch,DC1)) %>% 
+  as_tibble() %>% 
+  mutate(cells=Cells(np)) %>% 
+  pivot_longer(-c("cells","DC1","batch"),names_to="Genes",values_to="Expression")
+
+plots <-list()
+i <- 0
+for(gene in genes){
+  i <- i + 1
+  exp <- dat %>% filter(Genes==gene) %>% sample_frac(size=1)
+  p <- ggplot(NULL) + 
+    geom_point(data=exp,aes(x=DC1,y=Expression,color=batch),size=3,shape=16,alpha=0.9) + 
+    geom_smooth(data=exp,aes(x=DC1,y=Expression),linewidth=1,se=FALSE,linetype="dashed",color="grey30") + 
+    scale_x_continuous(expand = c(0.001, 0.001), breaks = seq(-0.1,0.1,0.05)) + 
+    scale_y_continuous(expand = c(0, 0)) + 
+    theme_classic() + 
+    theme(
+      legend.position = "none",
+      axis.text = element_blank(),
+      axis.title = element_blank()
+    ) + 
+    scale_color_manual(values=c("#219ebc","#fb8500"))
+  plots[[i]] <- p
+  ggsave(p,filename=paste0("Hhi/NeuralProgenitor/DC/",i,"_",gene,".svg"),height=1.5,width=8)
+}
+plots
+```
+
+### Density (Batch)
+```{r}
+g <- np@meta.data %>% ggplot(aes(x=DC1, fill=batch))
+p <- g + 
+  geom_density(alpha=0.4, adjust = 1,stat = "density",position = "identity",) +
+  scale_x_continuous(expand = c(0.001, 0.001), breaks = seq(-0.1,0.1,0.05)) + 
+  scale_y_continuous(expand = c(0,0)) +
+  theme_classic() + 
+  theme(
+    #legend.position = "none",
+    #axis.text = element_blank(),
+    #axis.title = element_blank()
+  ) + 
+  scale_fill_manual(values=c("#219ebc","#fb8500"))
+p
+
+ggsave(p,filename=paste0("Hhi/NeuralProgenitor/DC/Batch.svg"),height=1.5,width=8)
+```
+
+### UMAP
+```{r}
+p <- FeaturePlot(object = np, c("DC1"),ncol=1, reduction = "umap.harmony", order=FALSE, pt.size = 2) &
+  theme_void() &
+  theme(
+    aspect.ratio = 1,
+    plot.title = element_blank(),
+    legend.position = "none"
+    ) &
+  scale_color_viridis(option="mako",direction = -1) &
+  scale_x_continuous(expand=c(0.05,0.05)) &
+  scale_y_continuous(expand=c(0.05,0.05))
+p
+
+ggsave(p,filename=paste0("Hhi/NeuralProgenitor/DC/UMAP.png"),height=3,width=3)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+

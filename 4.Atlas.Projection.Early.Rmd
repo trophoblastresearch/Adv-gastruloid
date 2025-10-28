@@ -1,0 +1,927 @@
+---
+title: "Atlas projction"
+output: html_notebook
+---
+
+# Libraries
+```{r}
+library(tidyverse)
+
+library(scran)
+library(Seurat)
+
+library(lemon)
+library(ggsci)
+library(viridis)
+library(RColorBrewer)
+library(scCustomize)
+library(directlabels)
+library(tidyplots)
+```
+
+```{r}
+library(symphony)
+library(harmony)
+library(magrittr)
+library(Matrix)
+library(irlba)
+source("utils_seurat.R")
+```
+
+```{r}
+"%not.in%" <- Negate("%in%")
+
+mypal <- c(pal_jco("default")(10),
+           pal_startrek("uniform")(7),
+           pal_flatui("default")(10),
+           pal_frontiers("default")(10),
+           pal_cosmic("hallmarks_light")(10),
+           pal_npg("nrc")(10),
+           pal_aaas("default")(10),
+           pal_nejm("default")(8),
+           pal_lancet("lanonc")(9),
+           pal_ucscgb("default")(26),
+           pal_d3("category20")(20),
+           pal_observable("observable10")(10),
+           pal_igv("default")(51),
+           pal_rickandmorty("schwifty")(12)) %>% unlist() %>% unique()
+
+vpal <- viridis(n = 10, option = "D")
+```
+
+# Load Data
+## EEM
+```{r}
+eem <- readRDS("D0-6.rds")
+eem <- JoinLayers(eem)
+eem <- CreateSeuratObject(counts=LayerData(eem, assay = "RNA", layer = "counts"), meta.data=eem@meta.data)
+
+eem$orig.dataset <- "Sekiya"
+eem$stage <- eem$Day
+
+colmap <- tibble(
+  Annotation = eem$Annotation %>% unique() %>% sort(),
+  Annotation.color = mypal[1:21]
+)
+
+meta <- tibble(
+  cells = Cells(eem),
+  Annotation = eem$Annotation
+) %>% 
+  left_join(colmap) %>% 
+  select(cells,Annotation.color) %>% 
+  column_to_rownames("cells")
+
+eem <- eem %>% AddMetaData(metadata = meta)
+
+```
+
+```{r}
+d0 <- readRDS("D9-35.rds") %>% subset(subset = Annotation_Level1 %in% c("PSCs","NMLCs"))
+
+d0 <- CreateSeuratObject(counts=LayerData(d0, assay = "RNA", layer = "counts"), meta.data=d0@meta.data)
+
+d0$orig.dataset <- "Sekiya"
+d0$stage <- d0$Day
+d0$batch <- d0$orig.dataset
+```
+
+## CS7
+### SS2
+```{r}
+tys <- readRDS("Realignment_2024-A/Tyser/Tyser.rds")
+tys[["RNA"]] <- split(tys[["RNA"]], f = tys$orig.ident)
+tys@meta.data <- tys@meta.data %>% 
+    dplyr::rename("authors_annotation"=authors_labels,
+           "stage"=devTime,
+           "orig.dataset"=dataset) %>% 
+    mutate(cs.annotation=paste0(stage,"_",authors_annotation))
+tys@meta.data %>% head()
+tys
+tys$batch <- tys$orig.dataset
+```
+
+### STOmics
+```{r}
+cui <- readRDS("Spatial/CS7_human_embryo.rds")
+
+cui[["percent.mt"]] <- PercentageFeatureSet(cui, pattern = "^MT-")
+
+cui$orig.dataset <- "Cui"
+cui$authors_annotation <- cui$clusters
+cui$stage <- "CS7"
+cui$batch <- "STO_CS7"
+```
+
+## CS8
+### STOmics
+```{r}
+xia <- readRDS("Spatial/cs8_human_embryo.rds")
+
+xia[["percent.mt"]] <- PercentageFeatureSet(xia, pattern = "^MT-")
+
+xia$orig.dataset <- "Xiao"
+xia$authors_annotation <- xia$clusters
+xia$stage <- "CS8"
+xia$batch <- "STO_CS8"
+
+xia <- CreateSeuratObject(counts=LayerData(xia, assay = "RNA", layer = "counts"), meta.data=xia@meta.data)
+```
+
+# CS10
+```{r}
+cs10 <- readRDS("Realignment_2024-A/Zeng/Zeng.CS10.rds")
+cs10 <- JoinLayers(cs10)
+
+cs10 <- CreateSeuratObject(counts=LayerData(cs10, assay = "RNA", layer = "counts"), meta.data=cs10@meta.data)
+```
+
+
+# Tyser
+## Direct Reference Building from expression
+```{r}
+tys <- NormalizeData(tys)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+tys <- CellCycleScoring(tys, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+tys <- FindVariableFeatures(tys,nfeatures = 3000)
+tys <- ScaleData(tys, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+
+tys <- RunPCA(tys)
+```
+
+```{r}
+ref_exp_full = LayerData(tys,layer="data")
+ref_metadata = tys@meta.data %>% mutate(cell_id=Cells(tys))
+
+ref_exp_full[1:5, 1:2]
+```
+
+```{r}
+set.seed(0)
+reference = symphony::buildReference(
+    ref_exp_full,
+    ref_metadata,
+    vars = NULL,         # variables to integrate over
+    K = 100,                   # number of Harmony clusters
+    verbose = TRUE,            # verbose output
+    do_umap = TRUE,            # can set to FALSE if want to run umap separately later
+    do_normalize = FALSE,      # set to TRUE if input counts are not normalized yet
+    vargenes_method = 'vst',   # method for variable gene selection ('vst' or 'mvp')
+    vargenes_groups = 'authors_annotation', # metadata column specifying groups for variable gene selection 
+    topn = 5000,               # number of variable genes to choose per group
+    d = 50,                    # number of PCs
+    umap_min_dist = 0.5,
+    save_uwot_path = 'Tyser/cs7_uwot_model'
+)
+```
+
+## Map Query
+### PSC
+```{r}
+eem.gas <- eem %>% 
+  subset(subset = Annotation %in% c("PSC","PS","Noto","LP.Meso-1","LP.Meso-2","EXE.Meso","LP.Meso-3","Endothelium","Endo-1","Endo-2")) %>% 
+  subset(subset = Day %in% c("0","1","2","3","4"))
+
+que <- mapQuery(
+    exp_query = eem.gas[["RNA"]]$counts, 
+    metadata_query = eem.gas@meta.data, 
+    ref_obj = reference,
+    vars = "batch",
+    verbose = TRUE, 
+    do_normalize = TRUE,
+    do_umap = TRUE,
+    sigma = 0.1,
+    return_type = 'Seurat'
+)
+```
+
+#### Plot
+```{r}
+n <- 22
+
+reference$meta_data <- reference$meta_data %>% 
+  mutate(annot.dataset = paste0(orig.dataset,".",authors_annotation))
+
+vivo.col <- tibble(
+  annot.dataset = reference$meta_data$annot.dataset %>% unique(),
+  annot.dataset.color = c(mypal[22:32])
+  )
+
+dat <- bind_rows(
+  bind_cols(reference$meta_data,reference$umap$embedding) %>% left_join(vivo.col) %>% mutate(Data = "Atlas") %>% dplyr::rename("umap_1"="UMAP1","umap_2"="UMAP2"),
+  bind_cols(que@meta.data,que@reductions$umap@cell.embeddings) %>% mutate(Data = "EmbryoModel")
+) %>% 
+  as_tibble()
+
+x.min <- (reference$umap$embedding[,1] %>% min())-0.5
+x.max <- (reference$umap$embedding[,1] %>% max())+0.5
+y.min <- (reference$umap$embedding[,2] %>% min())-0.5
+y.max <- (reference$umap$embedding[,2] %>% max())+0.5
+```
+
+```{r}
+tys.lab <- vivo.col %>% 
+  filter(str_detect(annot.dataset,"Tyser"))
+tys.lab.list <- tys.lab$annot.dataset
+names(tys.lab.list) <- tys.lab$annot.dataset.color
+tys.lab.list <- c(tys.lab.list,"grey90"="NA")
+
+g <- dat %>% 
+  mutate(annot.dataset.color=ifelse(orig.dataset %in% c("Tyser"),annot.dataset.color,NA)) %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.dataset=fct_relevel(as_factor(orig.dataset),c("Sekiya","Tyser"))) %>% 
+  arrange(orig.dataset) %>% 
+  sample_frac(size=1) %>%
+  ggplot(aes(x=umap_1,y=umap_2,colour=annot.dataset.color, text=annot.dataset, size=orig.dataset))
+p.ref <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_identity(guide = "legend", labels = tys.lab.list) + 
+  scale_size_manual(values = c(3,3)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.ref
+
+ggsave(plot=p.ref, filename="Tyser/Tyser.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+```{r}
+tys.lab <- vivo.col %>% 
+  filter(str_detect(annot.dataset,"Tyser"))
+tys.lab.list <- tys.lab$annot.dataset
+names(tys.lab.list) <- tys.lab$annot.dataset.color
+tys.lab.list <- c(tys.lab.list,"grey90"="NA")
+
+g <- dat %>% 
+  mutate(annot.dataset.color=ifelse(authors_annotation %in% c("Nascent Mesoderm"),annot.dataset.color,"grey90")) %>% 
+  filter(orig.dataset=="Tyser") %>% 
+  mutate(authors_annotation=fct_relevel(as_factor(authors_annotation),c("Hemogenic Endothelial Progenitors","ExE Mesoderm","Erythroblasts","Endoderm","Primitive Streak","Advanced Mesoderm","Epiblast","Non-Neural Ectoderm","Emergent Mesoderm","Axial Mesoderm","Nascent Mesoderm"))) %>% 
+  arrange(authors_annotation) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=annot.dataset.color, text=annot.dataset, size=orig.dataset))
+p.ref <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_identity(guide = "legend", labels = tys.lab.list) + 
+  scale_size_manual(values = c(3,3)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.ref
+
+ggsave(plot=p.ref, filename="Tyser/Tyser.Axial.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+```{r}
+eem.lab.list <- eem$Annotation
+names(eem.lab.list) <- eem$Annotation.color
+eem.lab.list <- c(eem.lab.list,"grey90"="NA")
+
+g <- dat %>% 
+  mutate(Annotation.color=ifelse(orig.dataset %in% c("Sekiya"),Annotation.color,"grey90")) %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.dataset=fct_relevel(as_factor(orig.dataset),c("Tyser","Sekiya"))) %>% 
+  arrange(orig.dataset) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=Annotation.color, text=annot.dataset, size=orig.dataset))
+p.que <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_identity(guide = "legend", labels = eem.lab.list) + 
+  scale_size_manual(values = c(3,3)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.que
+
+ggsave(plot=p.que, filename="Tyser/EEM.Gast.0-4.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+### D0
+```{r}
+que <- mapQuery(
+    exp_query = d0[["RNA"]]$counts, 
+    metadata_query = d0@meta.data, 
+    ref_obj = reference,
+    vars = "batch",
+    verbose = TRUE, 
+    do_normalize = TRUE,
+    do_umap = TRUE,
+    sigma = 0.5,
+    return_type = 'Seurat'
+)
+```
+
+#### Plot
+```{r}
+n <- 22
+
+reference$meta_data <- reference$meta_data %>% 
+  mutate(annot.dataset = paste0(orig.dataset,".",authors_annotation))
+
+vivo.col <- tibble(
+  annot.dataset = reference$meta_data$annot.dataset %>% unique(),
+  annot.dataset.color = c(mypal[22:32])
+  )
+
+dat <- bind_rows(
+  bind_cols(reference$meta_data,reference$umap$embedding) %>% left_join(vivo.col) %>% mutate(Data = "Atlas") %>% dplyr::rename("umap_1"="UMAP1","umap_2"="UMAP2"),
+  bind_cols(que@meta.data,que@reductions$umap@cell.embeddings) %>% mutate(Data = "EmbryoModel")
+) %>% 
+  as_tibble()
+```
+
+```{r}
+eem.lab.list <- eem$Annotation
+names(eem.lab.list) <- eem$Annotation.color
+eem.lab.list <- c(eem.lab.list,"grey90"="NA")
+
+g <- dat %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.dataset=fct_relevel(as_factor(orig.dataset),c("Tyser","Sekiya"))) %>% 
+  arrange(orig.dataset) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=Annotation_Level1, text=annot.dataset, size=orig.dataset))
+p.que <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_manual(values=c("#CC0C00FF","#0073C2FF"), na.value = "grey90") + 
+  scale_size_manual(values = c(3,2)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.que
+
+ggsave(plot=p.que, filename="Tyser/EEM.D0.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+# CS7,8
+## Merge
+```{r}
+common.features <- Reduce(intersect, list(rownames(tys), rownames(cui), rownames(xia)))
+
+vivo <- merge(x=tys[common.features, ],y=list(cui[common.features, ],xia[common.features, ]))
+
+vivo <- NormalizeData(vivo)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+vivo.cc <- JoinLayers(vivo)
+vivo.cc <- CellCycleScoring(vivo.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = vivo.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(vivo.cc)
+gc()
+
+vivo <- AddMetaData(vivo, metadata = cc.score)
+
+vivo <- FindVariableFeatures(vivo,nfeatures = 3000)
+vivo <- ScaleData(vivo, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+vivo <- RunPCA(vivo)
+```
+
+## Harmony Matrix
+```{r}
+embedding <- Seurat::Embeddings(vivo, reduction = "pca")
+
+dims.use <- seq_len(ncol(embedding))
+
+metavars_df <- Seurat::FetchData(vivo, names(vivo@meta.data)) %>% 
+  mutate(batch=orig.ident)
+
+group.by.vars <- c("batch")
+```
+
+```{r}
+set.seed(0)
+harmonyObject = harmony::HarmonyMatrix(
+    data_mat = embedding,
+    meta_data = metavars_df,
+    vars_use = group.by.vars,
+    do_pca = FALSE,
+    npcs = 0,
+    theta = 1, 
+    lambda = NULL,
+    sigma = 0.1, 
+    nclust = NULL,
+    tau = 0,
+    block.size = 0.05,
+    max.iter.harmony = 10,
+    max.iter.cluster = 20,
+    epsilon.cluster = 1e-5,
+    epsilon.harmony = 1e-4,
+    plot_convergence = FALSE,
+    return_object = TRUE,
+    verbose = TRUE, 
+    reference_values = NULL,
+)
+
+harmonyEmbed <- t(as.matrix(harmonyObject$Z_corr))
+rownames(harmonyEmbed) <- row.names(embedding)
+colnames(harmonyEmbed) <- paste0("harmony", "_", seq_len(ncol(harmonyEmbed)))
+
+harmonyClusters <- t(harmonyObject$R)
+rownames(harmonyClusters) <- row.names(embedding)
+colnames(harmonyClusters) <- paste0('R', seq_len(ncol(harmonyClusters)))
+
+harmonydata <- Seurat::CreateDimReducObject(
+  embeddings = harmonyEmbed,
+  stdev = as.numeric(apply(harmonyEmbed, 2, stats::sd)),
+  assay = "RNA",
+  key = "harmony",
+  misc=list(R=harmonyClusters))
+
+vivo[["harmony"]] <- harmonydata
+```
+
+## Build Reference
+```{r}
+vivo <- JoinLayers(vivo)
+
+dim <- 30
+k <- 10
+mind <- 0.1
+
+vivo[['umap']] <- RunUMAP2(Embeddings(vivo, 'harmony')[, 1:dim],
+                          n.neighbors = k,
+                          min.dist = mind,
+                          spread = 0.5,
+                          metric = "manhattan",
+                          assay='RNA', verbose=TRUE, umap.method='uwot',
+                          reduction.key = "umap_",
+                          return.model=TRUE)
+```
+
+```{r}
+vivo.ref <- buildReferenceFromSeurat(vivo, verbose = TRUE, save_umap = TRUE, 
+                                    save_uwot_path='Tys_STO/vivo_cache_symphony.uwot')
+
+vivo.ref$normalization_method = 'log(CP10k+1)'
+```
+
+## Map Query
+
+### PSCs
+```{r}
+eem.gas <- eem %>% 
+  subset(subset = Annotation %in% c("PSC","PS","Noto","LP.Meso-1","LP.Meso-2","EXE.Meso","LP.Meso-3","Endothelium","Endo-1","Endo-2")) %>% 
+  subset(subset = Day %in% c("0","1","2","3","4"))
+
+que <- mapQuery(
+    exp_query = eem.gas[["RNA"]]$counts, 
+    metadata_query = eem.gas@meta.data, 
+    ref_obj = vivo.ref,
+    vars = "batch",
+    verbose = TRUE, 
+    do_normalize = TRUE,
+    do_umap = TRUE,
+    sigma = 0.5,
+    return_type = 'Seurat'
+)
+```
+
+#### Plot
+```{r}
+vivo@meta.data <- vivo@meta.data %>% 
+  mutate(annot.dataset = paste0(orig.dataset,".",authors_annotation))
+
+vivo.col <- tibble(
+  annot.dataset = vivo$annot.dataset %>% unique(),
+  annot.dataset.color = c(mypal[22:32],mypal[140:163])
+  )
+
+dat <- bind_rows(
+  bind_cols(vivo@meta.data,vivo@reductions$umap@cell.embeddings) %>% left_join(vivo.col) %>% mutate(Data = "Atlas"),
+  bind_cols(que@meta.data,que@reductions$umap@cell.embeddings) %>% mutate(Data = "EmbryoModel")
+) %>% 
+  as_tibble()
+
+x.min <- (vivo@reductions$umap@cell.embeddings[,1] %>% min())-0.5
+x.max <- (vivo@reductions$umap@cell.embeddings[,1] %>% max())+0.5
+y.min <- (vivo@reductions$umap@cell.embeddings[,2] %>% min())-0.5
+y.max <- (vivo@reductions$umap@cell.embeddings[,2] %>% max())+0.5
+```
+
+```{r}
+tys.lab <- vivo.col %>% 
+  filter(str_detect(annot.dataset,"Tyser"))
+tys.lab.list <- tys.lab$annot.dataset
+names(tys.lab.list) <- tys.lab$annot.dataset.color
+tys.lab.list <- c(tys.lab.list,"grey90"="NA")
+
+g <- dat %>% 
+  mutate(annot.dataset.color=ifelse(orig.dataset %in% c("Tyser"),annot.dataset.color,"grey90")) %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.dataset=fct_relevel(as_factor(orig.dataset),c("Cui","Xiao","Sekiya","Tyser"))) %>% 
+  arrange(orig.dataset) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=annot.dataset.color, text=annot.dataset, size=orig.dataset))
+p.ref <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_identity(guide = "legend", labels = tys.lab.list) + 
+  scale_size_manual(values = c(1,1,1,2)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.ref
+
+ggsave(plot=p.ref, filename="Tys_STO/Tyser.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+
+```{r}
+cui.lab <- vivo.col %>% 
+  filter(str_detect(annot.dataset,"Cui"))
+cui.lab.list <- cui.lab$annot.dataset
+names(cui.lab.list) <- cui.lab$annot.dataset.color
+cui.lab.list <- c(cui.lab.list,"grey90"="NA")
+
+g <- dat %>% 
+  mutate(annot.dataset.color=ifelse(orig.dataset %in% c("Cui"),annot.dataset.color,"grey90")) %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.dataset=fct_relevel(as_factor(orig.dataset),c("Xiao","Sekiya","Tyser","Cui"))) %>% 
+  arrange(orig.dataset) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=annot.dataset.color, text=annot.dataset, size=orig.dataset))
+p.ref <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_identity(guide = "legend", labels = cui.lab.list) + 
+  scale_size_manual(values = c(1,1,1,1)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.ref
+
+ggsave(plot=p.ref, filename="Tys_STO/Cui.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+
+```{r}
+xia.lab <- vivo.col %>% 
+  filter(str_detect(annot.dataset,"Xiao"))
+xia.lab.list <- xia.lab$annot.dataset
+names(xia.lab.list) <- xia.lab$annot.dataset.color
+xia.lab.list <- c(xia.lab.list,"grey90"="NA")
+
+g <- dat %>% 
+  mutate(annot.dataset.color=ifelse(orig.dataset %in% c("Xiao"),annot.dataset.color,"grey90")) %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.dataset=fct_relevel(as_factor(orig.dataset),c("Sekiya","Tyser","Cui","Xiao"))) %>% 
+  arrange(orig.dataset) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=annot.dataset.color, text=annot.dataset, size=orig.dataset))
+p.ref <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_identity(guide = "legend", labels = xia.lab.list) + 
+  scale_size_manual(values = c(1,1,1,1)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.ref
+
+ggsave(plot=p.ref, filename="Tys_STO/Xiao.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+```{r}
+eem.lab.list <- eem$Annotation
+names(eem.lab.list) <- eem$Annotation.color
+eem.lab.list <- c(eem.lab.list,"grey90"="NA")
+
+g <- dat %>% 
+  mutate(Annotation.color=ifelse(orig.dataset %in% c("Sekiya"),Annotation.color,"grey90")) %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.dataset=fct_relevel(as_factor(orig.dataset),c("Tyser","Cui","Xiao","Sekiya"))) %>% 
+  arrange(orig.dataset) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=Annotation.color, text=annot.dataset, size=orig.dataset))
+p.que <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_identity(guide = "legend", labels = eem.lab.list) + 
+  scale_size_manual(values = c(1,1,1,2)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.que
+
+ggsave(plot=p.que, filename="Tys_STO/EEM.PSC.0-4.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+### NMLCs
+```{r}
+eem.nmp <- eem %>% subset(subset = Annotation %in% c("NMLC","NMP-N","NMP-M","pPSM","aPSM","Somite","Inter.Meso","SC-1","SC-2","SC-3")) %>% 
+  subset(subset = Day %in% c("0","1"))
+
+que <- mapQuery(
+    exp_query = eem.nmp[["RNA"]]$counts, 
+    metadata_query = eem.nmp@meta.data, 
+    ref_obj = vivo.ref,
+    vars = "batch",
+    verbose = TRUE, 
+    do_normalize = TRUE,
+    do_umap = TRUE,
+    sigma = 0.5,
+    return_type = 'Seurat'
+)
+```
+
+#### Plot
+```{r}
+vivo@meta.data <- vivo@meta.data %>% 
+  mutate(annot.dataset = paste0(orig.dataset,".",authors_annotation))
+
+vivo.col <- tibble(
+  annot.dataset = vivo$annot.dataset %>% unique(),
+  annot.dataset.color = c(mypal[22:32],mypal[140:163])
+  )
+
+dat <- bind_rows(
+  bind_cols(vivo@meta.data,vivo@reductions$umap@cell.embeddings) %>% left_join(vivo.col) %>% mutate(Data = "Atlas"),
+  bind_cols(que@meta.data,que@reductions$umap@cell.embeddings) %>% mutate(Data = "EmbryoModel")
+) %>% 
+  as_tibble()
+
+x.min <- (vivo@reductions$umap@cell.embeddings[,1] %>% min())-0.5
+x.max <- (vivo@reductions$umap@cell.embeddings[,1] %>% max())+0.5
+y.min <- (vivo@reductions$umap@cell.embeddings[,2] %>% min())-0.5
+y.max <- (vivo@reductions$umap@cell.embeddings[,2] %>% max())+0.5
+```
+
+```{r}
+eem.lab <- eem@meta.data %>% distinct(Annotation,Annotation.color) %>% mutate(Annotation=as.character(Annotation))
+eem.lab.list <- eem.lab$Annotation
+names(eem.lab.list) <- eem.lab$Annotation.color
+eem.lab.list <- c(eem.lab.list,"grey90"="NA")
+
+g <- dat %>% 
+  mutate(Annotation.color=ifelse(orig.dataset %in% c("Sekiya"),Annotation.color,"grey90")) %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.dataset=fct_relevel(as_factor(orig.dataset),c("Tyser","Cui","Xiao","Sekiya"))) %>% 
+  arrange(orig.dataset) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=Annotation.color, text=annot.dataset, size=orig.dataset))
+p.que <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    #legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_identity(guide = "legend", labels = eem.lab.list) + 
+  scale_size_manual(values = c(1,1,1,2)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.que
+
+ggsave(plot=p.que, filename="Tys_STO/NMP.0-1.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+# NMP
+## Merge
+```{r}
+#vivo <- merge(x=cs10,y=cs11)
+
+vivo <- cs10
+
+vivo <- vivo %>% subset(subset = authors_annotation %in% c("NMP","Neural tbue 1","Neural tbue 2","Neural tbue 3","Neural Crest",
+                                                           "Paraxial mesoderm","Presomitic Mesoderm","Somite","Intermediate Mesoderm"))
+
+vivo <- NormalizeData(vivo)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+vivo.cc <- JoinLayers(vivo)
+vivo.cc <- CellCycleScoring(vivo.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = vivo.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(vivo.cc)
+gc()
+
+vivo <- AddMetaData(vivo, metadata = cc.score)
+
+vivo <- FindVariableFeatures(vivo,nfeatures = 3000)
+vivo <- ScaleData(vivo, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+vivo <- RunPCA(vivo)
+```
+
+## Harmony Matrix
+```{r}
+embedding <- Seurat::Embeddings(vivo, reduction = "pca")
+
+dims.use <- seq_len(ncol(embedding))
+
+metavars_df <- Seurat::FetchData(vivo, names(vivo@meta.data)) %>% 
+  mutate(batch=orig.ident)
+
+group.by.vars <- c("batch")
+```
+
+```{r}
+set.seed(0)
+harmonyObject = harmony::HarmonyMatrix(
+    data_mat = embedding,
+    meta_data = metavars_df,
+    vars_use = group.by.vars,
+    do_pca = FALSE,
+    npcs = 0,
+    theta = 2, 
+    lambda = NULL,
+    sigma = 0.1, 
+    nclust = NULL,
+    tau = 0,
+    block.size = 0.05,
+    max.iter.harmony = 10,
+    max.iter.cluster = 20,
+    epsilon.cluster = 1e-5,
+    epsilon.harmony = 1e-4,
+    plot_convergence = FALSE,
+    return_object = TRUE,
+    verbose = TRUE, 
+    reference_values = NULL,
+)
+
+harmonyEmbed <- t(as.matrix(harmonyObject$Z_corr))
+rownames(harmonyEmbed) <- row.names(embedding)
+colnames(harmonyEmbed) <- paste0("harmony", "_", seq_len(ncol(harmonyEmbed)))
+
+harmonyClusters <- t(harmonyObject$R)
+rownames(harmonyClusters) <- row.names(embedding)
+colnames(harmonyClusters) <- paste0('R', seq_len(ncol(harmonyClusters)))
+
+harmonydata <- Seurat::CreateDimReducObject(
+  embeddings = harmonyEmbed,
+  stdev = as.numeric(apply(harmonyEmbed, 2, stats::sd)),
+  assay = "RNA",
+  key = "harmony",
+  misc=list(R=harmonyClusters))
+
+vivo[["harmony"]] <- harmonydata
+```
+
+## Build Reference
+```{r}
+vivo <- JoinLayers(vivo)
+
+dim <- 20
+k <- 30
+mind <- 0.5
+
+vivo[['umap']] <- RunUMAP2(Embeddings(vivo, 'harmony')[, 1:dim],
+                          n.neighbors = k,
+                          min.dist = mind,
+                          spread = 0.5,
+                          metric = "manhattan",
+                          assay='RNA', verbose=TRUE, umap.method='uwot',
+                          reduction.key = "umap_",
+                          return.model=TRUE)
+```
+
+```{r}
+vivo.ref <- buildReferenceFromSeurat(vivo, verbose = TRUE, save_umap = TRUE, 
+                                    save_uwot_path='NMP/cs10NMP_cache_symphony.uwot')
+
+vivo.ref$normalization_method = 'log(CP10k+1)'
+```
+
+## Map Query
+```{r}
+eem.nmp <- eem %>% subset(subset = Annotation %in% c("NMLC","NMP-N","NMP-M","pPSM","aPSM","Somite","Inter.Meso","SC-1","SC-2","SC-3"))
+
+que <- mapQuery(
+    exp_query = eem.nmp[["RNA"]]$counts, 
+    metadata_query = eem.nmp@meta.data, 
+    ref_obj = vivo.ref,
+    vars = "batch",
+    verbose = TRUE, 
+    do_normalize = TRUE,
+    do_umap = TRUE,
+    sigma = 0.05,
+    return_type = 'Seurat'
+)
+```
+
+```{r}
+vivo@meta.data <- vivo@meta.data %>% 
+  mutate(annot.dataset = paste0(orig.dataset,".",authors_annotation))
+
+vivo.col <- tibble(
+  annot.dataset = vivo$annot.dataset %>% unique(),
+  annot.dataset.color = mypal[140:(140+length(unique(vivo$annot.dataset))-1)]
+  )
+
+dat <- bind_rows(
+  bind_cols(vivo@meta.data,vivo@reductions$umap@cell.embeddings) %>% left_join(vivo.col) %>% mutate(Data = "Atlas"),
+  bind_cols(que@meta.data,que@reductions$umap@cell.embeddings) %>% mutate(Data = "EmbryoModel")
+) %>% 
+  as_tibble()
+```
+
+### Plot
+```{r}
+g <- dat %>% 
+  mutate(annot.dataset.color=ifelse(is.na(annot.dataset.color),"grey90",annot.dataset.color)) %>% 
+  sample_frac(size=1) %>% 
+  filter(Data=="Atlas") %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=annot.dataset.color, text=annot.dataset))
+p.ref <- g +
+  geom_point(shape=16,size=2) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_identity() + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.ref
+
+ggsave(plot=p.ref, filename="NMP/CS10.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+```{r}
+g <- dat %>% 
+  mutate(Annotation.color=ifelse(is.na(Annotation.color),"grey90",Annotation.color)) %>% 
+  sample_frac(size=1) %>% 
+  arrange(Data) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=Annotation.color, size=Data))
+p.que <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_identity() + 
+  scale_size_manual(values = c(2,2)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.que
+
+ggsave(plot=p.que, filename="NMP/Query.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+
+
+
+
+
+
+
+

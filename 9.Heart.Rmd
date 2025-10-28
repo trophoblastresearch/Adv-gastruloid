@@ -1,0 +1,730 @@
+---
+title: "Heart"
+output: html_notebook
+---
+
+# Library
+```{r}
+library(tidyverse)
+library(data.table)
+library(lemon)
+library(Seurat)
+library(SeuratWrappers)
+library(ggsci)
+library(viridis)
+library(scds)
+library(scales)
+library(directlabels)
+library(patchwork)
+library(Matrix)
+library(Hmisc)
+library(tidyplots)
+library(scales)
+library(ggalluvial)
+library(scran)
+library(SingleCellExperiment)
+
+"%not.in%" <- Negate("%in%")
+
+mypal <- c(pal_jco("default")(10),
+           pal_startrek("uniform")(7),
+           pal_flatui("default")(10),
+           pal_frontiers("default")(10),
+           pal_cosmic("hallmarks_light")(10),
+           pal_npg("nrc")(10),
+           pal_aaas("default")(10),
+           pal_nejm("default")(8),
+           pal_lancet("lanonc")(9),
+           pal_ucscgb("default")(26),
+           pal_d3("category20")(20),
+           pal_observable("observable10")(10),
+           pal_igv("default")(51),
+           pal_rickandmorty("schwifty")(12)) %>% unlist() %>% unique()
+
+pal <- viridis(n = 10, option = "D")
+```
+
+```{r}
+library(symphony)
+library(harmony)
+library(magrittr)
+library(Matrix)
+library(irlba)
+source("/Users/asekiya/Desktop/Dry/Running/7_EmbryoModel/scRNA-seq/Result_v8/utils_seurat.R")
+```
+
+# Load Data
+```{r}
+hrt <- readRDS("/Users/asekiya/Desktop/Dry/Running/7_EmbryoModel/scRNA-seq/Result_v13/RDS/D35.Heart.Meso.rds")
+```
+
+# Normalization ~ PCA
+```{r}
+hrt <- NormalizeData(hrt)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes　
+
+hrt <- CellCycleScoring(hrt, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+hrt <- FindVariableFeatures(hrt,nfeatures = 3000)
+hrt <- ScaleData(hrt, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+hrt <- RunPCA(hrt)
+```
+
+# UMAP
+```{r}
+dim <- 30
+k <-30
+mind <- 0.3
+
+hrt <- RunUMAP(hrt,
+                dims = 1:dim, 
+                reduction = "pca",
+                reduction.name = "umap.pca", 
+                n.neighbors = k,
+                min.dist = mind, 
+                spread=0.5,
+                metric = "manhattan")
+```
+
+# Clustering
+```{r}
+hrt <- FindNeighbors(hrt, reduction = "pca", dims = 1:30, k.param = 10, nn.method = "annoy", annoy.metric = "manhattan")
+hrt <- FindClusters(hrt, resolution = 0.4, cluster.name = "seurat_clusters")
+```
+
+# Marker genes
+```{r}
+markers <- FindAllMarkers(hrt, only.pos = TRUE)
+
+markers %>% 
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  top_n(p_val_adj,n=-20)
+
+markers %>% 
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  filter(p_val_adj < 0.05) %>% 
+  write_tsv("Heart/Cluster_Markers.txt")
+```
+
+# Plot
+```{r}
+g <- bind_cols(hrt@meta.data,hrt@reductions$umap.pca@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umappca_1,y=umappca_2,colour=seurat_clusters))
+p <- g +
+  geom_point(shape=16,size=2) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_manual(values=mypal[72:length(mypal)])
+p
+
+ggsave(plot=p, filename="Heart/UMAP.cluster.png",
+       width=6, height=6, limitsize = FALSE)
+```
+
+```{r}
+pal <- rev(viridis_pal(option="rocket")(15)[6:15])
+genes <- read_tsv("Heart/Cluster_Markers_Selected.txt")
+
+cluster.list <- unique(genes$cluster)
+
+mes@meta.data <- mes@meta.data %>% 
+  mutate(seurat_clusters=fct_relevel(as_factor(seurat_clusters),cluster.list))
+
+p <- DotPlot(subset(mes,subset= seurat_clusters %in% cluster.list), 
+             features = genes$gene , group.by = "seurat_clusters") & 
+  scale_color_gradientn(colors=rev(viridis_pal(option="rocket")(15)[6:15])) &
+  scale_y_discrete(limits=rev) & 
+  scale_x_discrete() & 
+  theme(
+    axis.text.x = element_text(angle = 90,hjust=1,vjust=0.5)
+  )
+p
+
+ggsave(plot=p,
+       filename=paste0("Heart/DotPlot.svg"),
+       width=7.5, height=3,limitsize = FALSE)
+```
+
+```{r}
+list <- c("TNNT2","MYH6","HCN1","NR2F2","NR2F1","MYL2","MYH7","MYL3","CKM","IRX4")
+
+pal <- rev(viridis_pal(option="rocket")(15)[6:15])
+
+for(i in 1:length(list)){
+  mark <- list[i]
+  p <- FeaturePlot_scCustom(seurat_object = subset(hrt, subset = seurat_clusters %in% c("C6","C8")), 
+                            num_columns = 1,
+                            features = list[i], colors_use = pal, na_color = "grey90",
+                            reduction = "umap.pca", order=TRUE, pt.size = 3) & 
+    theme_void() & 
+    scale_x_continuous(limits=c(3.6,5.6)) & 
+    scale_y_continuous(limits=c(0.3,2.7)) &
+    theme(
+      legend.position = "none",
+      aspect.ratio = 2.4/2,
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      plot.title = element_blank(),
+      )
+  
+  ggsave(plot=p, 
+         filename=paste0("Heart/Features.Card/",i,"_",mark,".png"),
+         width=3, height=3, limitsize = FALSE)
+}
+```
+
+# Atlas projection
+## Prepare wholeerence
+```{r}
+asp.cnt <- read_tsv("Asp_EGAS00001003996/share_files/all_cells_count_matrix_filtered.tsv.gz") %>% 
+  column_to_rownames("...1")
+
+asp <- CreateSeuratObject(counts = asp.cnt)
+
+asp.meta <- read_tsv("Asp_EGAS00001003996/share_files/all_cells_meta_data_filtered.tsv") %>% 
+  mutate(orig.ident=paste0("Asp_",experiment)) %>% 
+  select("cells"=`...1`,orig.ident,celltype)
+meta <- tibble(cells=Cells(asp)) %>% 
+  left_join(asp.meta) %>% 
+  column_to_rownames("cells")
+asp <- asp %>% AddMetaData(metadata = meta)
+
+asp <- RenameCells(object = asp, add.cell.id = "Asp")
+
+asp$stage <- "7PCW"
+asp$authors_annotation <- asp$celltype
+asp[["percent.mt"]] <- PercentageFeatureSet(asp, pattern = "^MT-")
+asp$orig.dataset <- "Asp"
+
+asp$celltype <- NULL
+
+asp <- JoinLayers(asp)
+asp[["RNA"]] <- split(asp[["RNA"]], f = asp$orig.ident)
+
+asp <- NormalizeData(asp)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+asp.cc <- JoinLayers(asp)
+asp.cc <- CellCycleScoring(asp.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = asp.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(asp.cc)
+
+asp <- AddMetaData(asp, metadata = cc.score)
+
+asp <- FindVariableFeatures(asp,nfeatures = 3000)
+asp <- ScaleData(asp, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"), block.size=2000)
+asp <- RunPCA(asp)
+```
+
+```{r}
+dim <- 50
+k <- 50
+mind <- 0.5
+
+asp <- RunUMAP(asp,
+                dims = 1:dim, 
+                reduction = "pca",
+                reduction.name = "umap.pca", 
+                n.neighbors = k,
+                min.dist = mind, 
+                spread=0.5,
+                metric = "manhattan")
+```
+
+## HarmonyMatrix
+```{r}
+embedding <- Seurat::Embeddings(asp, reduction = "pca")
+
+dims.use <- seq_len(ncol(embedding))
+
+metavars_df <- Seurat::FetchData(asp, names(asp@meta.data))
+group.by.vars <- c("orig.ident")
+```
+
+```{r}
+set.seed(0)
+harmonyObject = harmony::HarmonyMatrix(
+    data_mat = embedding,
+    meta_data = metavars_df,
+    vars_use = group.by.vars,
+    do_pca = FALSE,
+    npcs = 0,
+    theta = NULL, 
+    lambda = NULL,
+    sigma = 0.1, 
+    nclust = NULL,
+    tau = 0,
+    block.size = 0.05,
+    max.iter.harmony = 10,
+    max.iter.cluster = 20,
+    epsilon.cluster = 1e-5,
+    epsilon.harmony = 1e-4,
+    plot_convergence = FALSE,
+    return_object = TRUE,
+    verbose = TRUE, 
+    wholeerence_values = NULL,
+)
+
+harmonyEmbed <- t(as.matrix(harmonyObject$Z_corr))
+rownames(harmonyEmbed) <- row.names(embedding)
+colnames(harmonyEmbed) <- paste0("harmony", "_", seq_len(ncol(harmonyEmbed)))
+
+harmonyClusters <- t(harmonyObject$R)
+rownames(harmonyClusters) <- row.names(embedding)
+colnames(harmonyClusters) <- paste0('R', seq_len(ncol(harmonyClusters)))
+
+harmonydata <- Seurat::CreateDimReducObject(
+  embeddings = harmonyEmbed,
+  stdev = as.numeric(apply(harmonyEmbed, 2, stats::sd)),
+  assay = "RNA",
+  key = "harmony",
+  misc=list(R=harmonyClusters))
+
+asp[["harmony"]] <- harmonydata
+```
+
+## Build wholeerence
+```{r}
+asp <- JoinLayers(asp)
+
+dim <- 50
+k <- 30
+mind <- 0.3
+
+asp[['umap']] <- RunUMAP2(Embeddings(asp, 'harmony')[, 1:dim],
+                          n.neighbors = k,
+                          min.dist = mind,
+                          spread = 0.5,
+                          metric = "manhattan",
+                          assay='RNA', verbose=TRUE, umap.method='uwot',
+                          reduction.key = "umap_",
+                          return.model=TRUE)
+
+```
+
+```{r}
+asp.whole <- buildwholeerenceFromSeurat(asp, verbose = TRUE, save_umap = TRUE, 
+                                    save_uwot_path='Heart/Asp_chache.uwot')
+
+asp.whole$normalization_method = 'log(CP10k+1)'
+```
+
+## Query cells
+```{r}
+hrt.sub <- hrt %>% subset(subset = Annotation %in% c("Atrial.Card","Ventricle.Card","Epicardium","SMC"))
+```
+
+```{r}
+hrt.sub$batch <- hrt.subb$orig.ident
+
+que <- mapQuery(
+    exp_query = hrt.sub[["RNA"]]$counts, 
+    metadata_query = hrt.sub@meta.data, 
+    whole_obj = asp.whole,
+    vars = "batch",
+    verbose = TRUE, 
+    do_normalize = TRUE,
+    do_umap = TRUE,
+    sigma = 0.1,
+    return_type = 'Seurat'
+)
+```
+
+```{r}
+que <- knnPredict.Seurat(que, asp.whole, "authors_annotation", confidence = TRUE, k=5)
+```
+
+## Plot
+```{r}
+start <- 27
+
+asp.col <- tibble(
+  authors_annotation = asp$authors_annotation %>% unique(),
+  annot.color = mypal[start:(start+length(unique(asp$authors_annotation))-1)]
+  )
+
+dat <- bind_rows(
+  bind_cols(asp@meta.data,asp@reductions$umap@cell.embeddings) %>% left_join(asp.col) %>% mutate(Data = "Atlas"),
+  bind_cols(que@meta.data,que@reductions$umap@cell.embeddings) %>% mutate(Data = "EmbryoModel") %>% mutate(stage=as.character(stage))
+) %>% 
+  as_tibble()
+
+x.min <- (asp@reductions$umap@cell.embeddings[,1] %>% min())-0.5
+x.max <- (asp@reductions$umap@cell.embeddings[,1] %>% max())+0.5
+y.min <- (asp@reductions$umap@cell.embeddings[,2] %>% min())-0.5
+y.max <- (asp@reductions$umap@cell.embeddings[,2] %>% max())+0.5
+
+g <- dat %>% 
+  sample_frac(size=1) %>% 
+  filter(orig.dataset == "Asp") %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=annot.color))
+p.whole <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_identity() + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.whole
+
+ggsave(plot=p.whole, filename="Heart/Asp.label.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+```{r}
+g <- dat %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.dataset=fct_relevel(as_factor(orig.dataset),c("Asp","Sekiya"))) %>% 
+  arrange(orig.dataset) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=Annotation, size=orig.dataset))
+p.que <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_manual(values = c("#42B540FF","#6F99ADFF","#FFDC91FF","#925E9FFF"), na.value = "grey90") + 
+  scale_size_manual(values = c(1,2)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.que
+plotly::ggplotly(p.que)
+
+ggsave(plot=p.que, filename="Heart/EM.Heart.related.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+```{r}
+al.dat <- que@meta.data %>% 
+  as_tibble() %>% 
+  mutate(cells=Cells(que)) %>% 
+  group_by(Annotation,authors_annotation) %>% 
+  summarise(freq=n()) %>% 
+  ungroup() %>% 
+  mutate(
+    Annotation=fct_relevel(as_factor(Annotation),c("Atrial cardiomyocyte","ventricular cardiomyocyte","Epicardium","Outflow tract")),
+    authors_annotation=fct_relevel(as_factor(authors_annotation),c("Atrial cardiomyocytes","Ventricular cardiomyocytes","Myoz2-enriched cardiomyocytes",
+                                                                           "Epicardial cells","Epicardium-derived cells","Fibroblast-like (related to cardiac skeleton connective tissue)",
+                                                                           "Fibroblast-like (related to smaller vascular development)","Fibroblast-like (related to larger vascular development)",
+                                                                           "Smooth muscle cells / fibroblast-like)"))) %>% 
+  arrange(Annotation,authors_annotation)
+  
+p <- ggplot(data = al.dat,
+       aes(axis1 = Annotation,   # First variable on the X-axis
+           axis2 = authors_annotation,
+           y = freq)) +
+  geom_alluvium(aes(fill = Annotation)) +
+  geom_stratum(width = 1 / 2.5) +
+  geom_text(stat = "stratum",
+            aes(label = after_stat(stratum))) +
+  theme_void() + 
+  theme(
+    legend.position = "none"
+  ) + 
+  scale_fill_manual(values = c("#42B540FF","#925E9FFF","#6F99ADFF","#FFDC91FF"))
+p  
+
+ggsave(plot=p, filename="Heart/Pred.Allu.svg",
+       width=5, height=5, limitsize = FALSE)
+```
+
+# TNNT2+ cells
+## Data
+```{r}
+tys <- readRDS("Tyser/Tyser.rds")
+tys[["RNA"]] <- split(tys[["RNA"]], f = tys$orig.ident)
+tys@meta.data <- tys@meta.data %>% 
+    dplyr::rename("authors_annotation"=authors_labels,
+           "stage"=devTime,
+           "orig.dataset"=dataset) %>% 
+    mutate(cs.annotation=paste0(stage,"_",authors_annotation))
+tys@meta.data %>% head()
+tys
+tys$batch <- tys$orig.dataset
+
+tys <- NormalizeData(tys)
+tys.hrt <- tys %>% subset(subset = TNNT2 >= 2)
+```
+
+```{r}
+whole <- readRDS("WholeEmbryo.Atlas.rds")
+
+whole <- FindNeighbors(whole, reduction = "harmony", dims = 1:50, k.param = 10, nn.method = "annoy", annoy.metric = "manhattan")
+whole <- FindClusters(whole, resolution = 0.3, cluster.name = "harmony_clusters")
+
+xz.hrt <- whole %>% subset(subset = harmony_clusters %in% c("17")) %>% subset(subset = TNNT2 >= 2)
+xz.hrt$label <- xz.hrt$orig.ident
+
+ze.hrt.cs10 <- xz.hrt %>% subset(subset = orig.dataset %in% c("Zeng")) %>% subset(subset = stage %in% c("CS10"))
+ze.hrt.cs12 <- xz.hrt %>% subset(subset = orig.dataset %in% c("Zeng")) %>% subset(subset = stage %in% c("CS12"))
+xu.hrt.cs12 <- xz.hrt %>% subset(subset = orig.dataset %in% c("Xu")) %>% subset(subset = stage %in% c("CS12"))
+xu.hrt.cs13 <- xz.hrt %>% subset(subset = orig.dataset %in% c("Xu")) %>% subset(subset = stage %in% c("CS13-14"))
+xu.hrt.cs15 <- xz.hrt %>% subset(subset = orig.dataset %in% c("Xu")) %>% subset(subset = stage %in% c("CS15-16"))
+```
+
+```{r}
+asp$label <- asp$orig.ident
+asp.hrt <- asp %>% subset(subset = authors_annotation %in% c("Atrial cardiomyocytes","Ventricular cardiomyocytes","Myoz2-enriched cardiomyocytes"))
+```
+
+```{r}
+eem <- readRDS("D0-6.rds")
+
+eem$orig.dataset <- "Sekiya"
+eem$stage <- eem$Day
+
+em.hrt.d6 <- eem %>% subset(subset = Day %in% c("6")) %>% subset(subset = TNNT2 >= 2)
+```
+
+```{r}
+lem <- readRDS("D9-35.rds")
+
+em.hrt.d9 <- lem %>% subset(subset = Annotation_Level1 %in% c("Card.Meso")) %>% subset(subset = Day %in% c("9"))
+em.hrt.d23 <- lem %>% subset(subset = Annotation_Level1 %in% c("Card.Meso")) %>% subset(subset = Day %in% c("23"))
+em.hrt.d35 <- lem %>% subset(subset = Annotation_Level1 %in% c("Card.Meso")) %>% subset(subset = Day %in% c("35"))
+```
+
+```{r}
+em.d9 <- readRDS("D9.Combi.rds")
+
+em.hrt.d9_2 <- d9 %>% 
+  subset(subset = orig.ident %in% c("EM_ix2_Day9","EM_5x5_Day9")) %>% 
+  subset(subset = Annotation %in% c("Card.Meso"))
+```
+
+```{r}
+hd.hrt.d35 <- hrt %>% subset(subset = harmony_clusters %in% c("8","9"))
+```
+
+## Merge
+```{r}
+em.hrt.d6$orig.ident <- "em.hrt.d6"
+em.hrt.d9$orig.ident <- "em.hrt.d9"
+em.hrt.d9_2$orig.ident <- "em.hrt.d9"
+em.hrt.d23$orig.ident <- "em.hrt.d23"
+em.hrt.d35$orig.ident <- "em.hrt.d35"
+hd.hrt.d35$orig.ident <- "em.hrt.d35"
+
+tys.hrt$orig.ident <- "tys.hrt.cs7"
+ze.hrt.cs10$orig.ident <- "ze.hrt.cs10"
+ze.hrt.cs12$orig.ident <- "ze.hrt.cs12"
+xu.hrt.cs12$orig.ident <- "xu.hrt.cs12"
+xu.hrt.cs13$orig.ident <- "xu.hrt.cs13"
+xu.hrt.cs15$orig.ident <- "xu.hrt.cs15"
+asp.hrt$orig.ident <- "asp.hrt.7pcw"
+```
+
+```{r}
+common.features <- Reduce(intersect, list(rownames(asp.hrt), rownames(em.hrt.d9)))
+
+hrts <- merge(x=asp.hrt[common.features,],
+              y=list(em.hrt.d6[common.features,],
+                     em.hrt.d9[common.features,],
+                     em.hrt.d9_2[common.features,],
+                     em.hrt.d23[common.features,],
+                     em.hrt.d35[common.features,],
+                     hd.hrt.d35[common.features,],
+                     tys.hrt[common.features,],
+                     ze.hrt.cs10[common.features,],
+                     ze.hrt.cs12[common.features,],
+                     xu.hrt.cs12[common.features,],
+                     xu.hrt.cs13[common.features,],
+                     xu.hrt.cs15[common.features,]))
+
+hrts <- JoinLayers(hrts)
+
+hrts <- CreateSeuratObject(counts=LayerData(hrts, assay = "RNA", layer = "counts"), meta.data=hrts@meta.data)
+
+hrts[["RNA"]] <- split(hrts[["RNA"]], f = hrts$orig.ident)
+
+hrts[["percent.mt"]] <- PercentageFeatureSet(hrts, pattern = "^MT-")
+```
+
+```{r}
+hrts <- NormalizeData(hrts)
+
+hrts <- hrts %>% subset(subset = TNNT2 >= 2)
+```
+
+## Scatter plot of MYH genes
+```{r}
+myh <- FetchData(hrts, layer = "data", vars=c("TNNT2","MYH6","MYH7",names(hrts@meta.data)))
+
+g <- myh %>% 
+  mutate(label=ifelse(!is.na(Day),str_extract(orig.ident,".*(?=_)"),orig.dataset)) %>% 
+  mutate(label=fct_relevel(as_factor(label),c("5x2","5x5","ix2","Zeng","Xu","Asp"))) %>% 
+  mutate(stage=ifelse(is.na(stage),Day,stage)) %>% 
+  mutate(Data=ifelse(stage %in% c("9","23","35"),"Vitro","Vivo")) %>% 
+  mutate(stage=fct_relevel(as_factor(stage),c("CS10","CS12","CS13-14","CS15-16","7PCW","9","23","35")),
+         Data=fct_relevel(as_factor(Data),c("Vivo","Vitro"))) %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=MYH6,y=MYH7,color=label))
+p <- g + geom_point(size=1.5, shape=16) + 
+  facet_rep_wrap(~ stage, repeat.tick.labels = T, ncol=5) + 
+  theme_classic() + 
+  theme(
+    aspect.ratio = 1,
+    panel.grid.major = element_line(color="grey80",linewidth = 0.2),
+    strip.background = element_blank()
+  ) + 
+  scale_color_manual(values=c(colors_discrete_seaside,"#D1422F"),na.value = "grey50")
+p
+
+ggsave(plot=p, filename="Heart/MYH.stage.col.svg",
+       width=10, height=5, limitsize = FALSE)
+```
+
+## PCA
+```{r}
+hrts.pb <- AggregateExpression(hrts, 
+                              assays = "RNA", 
+                              return.seurat = T, 
+                              group.by = c("orig.ident"),
+                              add.ident = NULL,
+                              normalization.method = "LogNormalize",
+                              scale.factor = 10000,
+                              verbose = TRUE)
+```
+
+```{r}
+features <- read_tsv("2024-A-hg38/genes.tsv")
+auto <- features %>% filter(chromosome %in% paste0("chr",seq(1,22)))
+```
+
+```{r}
+vivo <- hrts %>% subset(subset = orig.ident %in% c("asp.hrt.7pcw","ze.hrt.cs10","ze.hrt.cs12","xu.hrt.cs12","xu.hrt.cs13","xu.hrt.cs15"))
+vivo <- JoinLayers(vivo)
+vivo <- CreateSeuratObject(counts=LayerData(vivo, assay = "RNA", layer = "counts"), meta.data=vivo@meta.data)
+vivo <- vivo %>% subset(features = auto$gene_name)
+vivo <- NormalizeData(vivo)
+VariableFeatures(vivo)
+```
+
+```{r}
+all.genes <- rownames(hrts.pb)
+hrts.pb <- ScaleData(hrts.pb, features=all.genes)
+
+hrts.df <- LayerData(hrts.pb,layer="scale.data") %>%
+  as_tibble() %>%
+  mutate(Genes=Features(hrts.pb)) %>% 
+  dplyr::select(Genes,everything())
+```
+
+```{r}
+vivo <- FindVariableFeatures(vivo,nfeatures = 2000)
+
+pca <- hrts.df %>% 
+  filter(Genes %in% VariableFeatures(vivo)) %>% 
+  column_to_rownames("Genes") %>% 
+  t() %>% 
+  prcomp()
+
+summary(pca)
+```
+
+```{r}
+pcd <- tibble(
+  orig.ident = c("em.hrt.d6","em.hrt.d9","em.hrt.d23","em.hrt.d35","tys.hrt.cs7","ze.hrt.cs10","ze.hrt.cs12","xu.hrt.cs12","xu.hrt.cs13","xu.hrt.cs15","asp.hrt.7pcw"),
+  pseudo.day = c(20,23,37,49,14,22.5,27,27,30,36,49)
+)
+
+pca.df <- pca$x %>% 
+  as_tibble() %>% 
+  mutate(orig.ident=rownames(pca$x)) %>% 
+  select(orig.ident,everything()) %>% 
+  left_join(pcd)
+
+corr.vivo <- rcorr(as.matrix(pca.df %>% filter(orig.ident %in% c("tys.hrt.cs7","ze.hrt.cs10","ze.hrt.cs12","xu.hrt.cs12","xu.hrt.cs13","xu.hrt.cs15","asp.hrt.7pcw")) %>% select(-orig.ident)))
+corr <- rcorr(as.matrix(pca.df %>% select(-orig.ident)))
+
+corr.vivo.df <- tibble(
+  dataset = "Vivo",
+  PC=rownames(corr.vivo$r),
+  R=corr.vivo$r[,"pseudo.day"],
+  Pval=corr.vivo$P[,"pseudo.day"]
+) %>% 
+  filter(PC %not.in% c("pseudo.day"))
+
+corr.df <- tibble(
+  dataset = "Vivo+Vitro",
+  PC=rownames(corr$r),
+  R=corr$r[,"pseudo.day"],
+  Pval=corr$P[,"pseudo.day"]
+) %>% 
+  filter(PC %not.in% c("pseudo.day"))
+
+cor.df <- bind_rows(corr.vivo.df,corr.df) %>% 
+  mutate(logP=-log10(Pval))
+
+g <- cor.df %>% 
+  ggplot(aes(x=PC,y=dataset,size=logP,color=R))
+p <- g + 
+  geom_point(shape=16) + 
+  theme_classic() + 
+  theme(
+    axis.title.y = element_blank(),
+  ) + 
+  scale_color_gradientn(colors=c("#303F9F","white","#C2185B")) + 
+  scale_y_discrete(limits=rev)
+p
+
+g <- corr.vivo.df %>% 
+  mutate(logP=-log10(Pval)) %>% 
+  mutate(PC=fct_relevel(as_factor(PC),paste0("PC",seq(1,11)))) %>% 
+  arrange(PC) %>% 
+  filter(PC %in% paste0("PC",seq(1,10))) %>% 
+  ggplot(aes(x=PC,y=dataset,size=logP,color=R))
+p <- g + 
+  geom_point(shape=16) + 
+  theme_classic() + 
+  theme(
+    axis.title.y = element_blank(),
+  ) + 
+  scale_color_gradientn(colors=c("#303F9F","white","#C2185B")) + 
+  scale_y_discrete(limits=rev)
+p
+```
+
+```{r}
+pca.df <- pca.df %>% 
+  mutate(dataset=ifelse(orig.ident %in% c("tys.hrt.cs7","ze.hrt.cs10","ze.hrt.cs12","xu.hrt.cs12","xu.hrt.cs13","xu.hrt.cs15","asp.hrt.7pcw"),"Vivo","Vitro"))
+
+g <- pca.df %>% 
+  ggplot(aes(x=PC2,y=PC1,color=pseudo.day,shape=dataset,text=orig.ident))
+p <- g + 
+  geom_point(size=5) + 
+  theme_classic() + 
+  theme(
+    aspect.ratio = 1/4,
+  ) + 
+  scale_color_gradientn(colors=rev(viridis_pal(option="mako")(12)[2:10])) + 
+  scale_shape_manual(values=c(18,16)) + 
+  scale_x_reverse() + 
+  scale_y_continuous(expand=c(0.5,0.5))
+p
+
+ggsave(plot=p, filename="Heart/PCA1-2.svg",
+       width=5, height=3, limitsize = FALSE)
+```
+
+
+

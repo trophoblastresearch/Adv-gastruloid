@@ -1,0 +1,501 @@
+---
+title: "D9-35 Cell type annotation"
+output: html_notebook
+---
+
+# Library
+```{r}
+library(tidyverse)
+library(data.table)
+library(lemon)
+library(Seurat)
+library(SeuratWrappers)
+library(ggsci)
+library(viridis)
+library(RColorBrewer)
+library(scCustomize)
+
+"%not.in%" <- Negate("%in%")
+
+mypal <- c(pal_jco("default")(10),
+           pal_startrek("uniform")(7),
+           pal_flatui("default")(10),
+           pal_frontiers("default")(10),
+           pal_cosmic("hallmarks_light")(10),
+           pal_npg("nrc")(10),
+           pal_aaas("default")(10),
+           pal_nejm("default")(8),
+           pal_lancet("lanonc")(9),
+           pal_ucscgb("default")(26),
+           pal_d3("category20")(20),
+           pal_observable("observable10")(10),
+           pal_igv("default")(51),
+           pal_rickandmorty("schwifty")(12)) %>% unlist() %>% unique()
+
+pal <- viridis(n = 10, option = "D")
+```
+
+```{r}
+library(symphony)
+library(harmony)
+library(magrittr)
+library(Matrix)
+library(irlba)
+source("utils_seurat.R")
+```
+
+# Load Data
+```{r}
+lem <- readRDS("D9-35.rds")
+lem[["RNA"]] <- split(lem[["RNA"]], f = lem$batch)
+```
+
+# Normalization ~ PCA
+```{r}
+lem <- NormalizeData(lem)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+lem.cc <- JoinLayers(lem)
+lem.cc <- CellCycleScoring(lem.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = lem.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(lem.cc)
+
+lem <- AddMetaData(lem, metadata = cc.score)
+
+lem <- FindVariableFeatures(lem,nfeatures = 2000)
+lem <- ScaleData(lem, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+lem <- RunPCA(lem)
+```
+
+# Harmony integration
+```{r}
+lem <- IntegrateLayers(
+  object = lem, method = HarmonyIntegration, assay = "RNA",
+  theta=0.5, nclust=30, lambda = 500,
+  orig.reduction = "pca", new.reduction = "harmony", verbose = FALSE)
+```
+
+```{r}
+dim <- 50
+k <- 50
+mind <- 0.5
+
+lem <- RunUMAP(lem,
+              dims = 1:dim, 
+              reduction = "harmony",
+              reduction.name = "umap.harmony", 
+              n.neighbors = k,
+              min.dist = mind, 
+              spread=0.5,
+              metric = "manhattan")
+```
+
+# Clustering
+```{r}
+lem <- FindNeighbors(lem, reduction = "harmony", dims = 1:50, k.param = 10, nn.method = "annoy", annoy.metric = "manhattan")
+lem <- FindClusters(lem, resolution = 0.1, cluster.name = "harmony_clusters", nn.method = "annoy", annoy.metric = "manhattan")
+```
+
+# FindaMarkers
+```{r}
+lem <- JoinLayers(lem)
+
+markers <- FindAllMarkers(lem, only.pos = TRUE)
+
+markers %>% 
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  top_n(p_val_adj,n=-20)
+
+markers %>% 
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  filter(p_val_adj < 0.05) %>% 
+  write_tsv("LateEM_Results/Cluster_Markers.txt")
+```
+
+# Annotation
+```{r}
+anno <- read_tsv("LateEM_Results/Clusters_Level1.tsv")
+meta <- tibble(
+  cells=Cells(lem),
+  Clusters_Level1=lem$Clusters_Level1
+) %>% left_join(anno) %>% 
+  column_to_rownames("cells")
+
+lem <- lem %>% AddMetaData(metadata = meta)
+```
+
+# Plot
+## Annotation
+```{r}
+g <- bind_cols(lem@meta.data,lem@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=Color_Level1))
+p <- g +
+  geom_point(shape=16,size=1) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_identity()
+p
+ggsave(plot=p, filename="LateEM_Results/Annotation.png",
+       width=6, height=6, limitsize = FALSE)
+```
+
+## Origin.cell.type
+```{r}
+g <- bind_cols(lem@meta.data,lem@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=Origin.cell.type))
+p <- g +
+  geom_point(shape=16,size=1.5) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_manual(values=c("#7CB342","#3949AB"))
+p
+ggsave(plot=p, filename="LateEM_Results/Origin.png",
+       width=6, height=6, limitsize = FALSE)
+```
+
+## Day
+```{r}
+pal <- c(alpha(viridis_pal(option="inferno")(12)[1],0.5),viridis_pal(option="magma")(12)[c(11,8,6)])
+
+g <- bind_cols(lem@meta.data,lem@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,color=Day))
+p <- g +
+  geom_point(shape=16,size=1.5) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_manual(values=pal)
+p
+ggsave(plot=p, filename="LateEM_Results/Level1_Plot/Day.png",
+       width=6, height=6, limitsize = FALSE)
+```
+
+## Dot Plot
+```{r}
+selected.genes <- read_tsv("LateEM_Results/Cluster_Markers_selected.txt")
+
+lem@meta.data <- lem@meta.data %>% 
+  dplyr::mutate(Annotation_Level1=fct_relevel(as_factor(Annotation_Level1),c("PSCs","NMLCs","Endo","Meso-1","Meso-2","Mesothelium","Chondrocyte","Card.Meso","Endothelium","Neural prog.","Neuron","Neural crest","Ciliated cell")))
+
+p <- DotPlot(lem, features = unique(selected.genes$gene), group.by = "Annotation_Level1") & 
+  scale_color_gradientn(colors=rev(viridis_pal(option="rocket")(15)[6:15])) &
+  scale_y_discrete(limits=rev) &
+  theme(
+    axis.text.x = element_text(angle = 90,hjust=1,vjust=0.5)
+  )
+p
+
+ggsave(plot=p,
+       filename=paste0("LateEM_Results/DotPlot.svg"),
+       width=10.5, height=3.3,limitsize = FALSE)
+```
+
+## Feature Plot
+```{r}
+pal <- rev(viridis_pal(option="rocket")(15)[6:15])
+markers <- read_tsv("LateEM_Results/Cluster_Markers_selected.txt")
+
+genes <- markers$gene %>% unique()
+genes <- na.omit(genes)
+
+for(i in 1:length(genes)){
+  mark <- genes[i]
+  p <- FeaturePlot_scCustom(seurat_object = all, num_columns = 1, label = F,
+                            features = genes[i], colors_use = pal, na_color = "grey90",
+                            reduction = "umap.harmony", order=TRUE, pt.size = 3) & 
+    theme_void() & 
+    theme(
+      legend.position = "none",
+      aspect.ratio = 1,
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      plot.title = element_blank()
+      )
+  
+  ggsave(plot=p, 
+         filename=paste0("LateEM_Results/FeaturePlot/",i,".",mark,".png"),
+         width=5, height=5, limitsize = FALSE)
+}
+
+```
+
+# Atlas projection
+## Load Data
+### Zeng (CS10,12,13)
+```{r}
+zeng <- readRDS("data/Zeng_WholeEmbryo.rds")
+zeng <- JoinLayers(zeng)
+zeng[["RNA"]] <- split(zeng[["RNA"]], f = zeng$orig.ident)
+zeng
+```
+
+```{r}
+cs12.meta <- read_tsv("data/Zeng.CS12.annotation.tsv")
+cs12.meta %>% head()
+
+cs13.meta <- read_tsv("data/Zeng.CS13.annotation.tsv")
+cs13.meta %>% head()
+
+meta <- bind_rows(cs12.meta,cs13.meta)
+
+anno <- tibble(barcodes=Cells(zeng)) %>% 
+    left_join(meta)
+anno %>% head()
+
+anno <- anno %>% column_to_rownames("barcodes")
+anno %>% head()
+
+zeng <- zeng %>% AddMetaData(metadata = anno)
+
+zeng@meta.data <- zeng@meta.data %>% 
+    mutate(cs.annotation=ifelse(is.na(cs.annotation),paste0(stage,"_",authors_annotation),cs.annotation))
+
+zeng@meta.data %>% head()
+```
+
+```{r}
+Idents(zeng) <- zeng$cs.annotation
+
+zeng.ds <- zeng %>% subset(downsample = 2000)
+
+zeng.ds
+```
+
+### Xu (CS12,13-14,15-16)
+```{r}
+xu <- readRDS("data/Xu_WholeEmbryo.rds")
+xu[["RNA"]] <- split(xu[["RNA"]], f = xu$orig.ident)
+xu@meta.data <- xu@meta.data %>% mutate(cs.annotation=paste0(stage,"_",authors_annotation))
+xu
+```
+
+```{r}
+Idents(xu) <- xu$cs.annotation
+
+xu.ds <- xu %>% subset(downsample = 1300)
+
+xu.ds
+```
+
+```{r}
+rm(zeng,xu)
+```
+
+## Integration References
+```{r}
+vivo <- merge(x=zeng.ds,y=xu.ds)
+
+vivo <- NormalizeData(vivo)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+vivo.cc <- JoinLayers(vivo)
+vivo.cc <- CellCycleScoring(vivo.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = vivo.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(vivo.cc)
+gc()
+
+vivo <- AddMetaData(vivo, metadata = cc.score)
+
+vivo <- FindVariableFeatures(vivo,nfeatures = 3000)
+vivo <- ScaleData(vivo, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+vivo <- RunPCA(vivo)
+```
+
+```{r}
+clust <- read_tsv("Barcode.Annotation.tsv") %>% select(-cell_type)
+
+anno <- read_tsv("Annotation.tsv")
+
+anno <- read_tsv("Annotation.tsv") %>% 
+  mutate(stage.cluster=paste0(stage,".",cluster)) %>% 
+  select(stage.cluster,cell_type)
+
+meta <- tibble(cells=Cells(vivo)) %>% 
+  left_join(clust) %>% 
+  left_join(anno) %>% 
+  column_to_rownames("cells")
+
+vivo <- vivo %>% AddMetaData(metadata = meta)
+```
+
+## Harmony matrix
+```{r}
+embedding <- Seurat::Embeddings(vivo, reduction = "pca")
+
+dims.use <- seq_len(ncol(embedding))
+
+metavars_df <- Seurat::FetchData(vivo, names(vivo@meta.data)) %>% 
+  mutate(batch=orig.ident)
+
+group.by.vars <- c("batch")
+```
+
+```{r}
+set.seed(0)
+harmonyObject = harmony::HarmonyMatrix(
+    data_mat = embedding,
+    meta_data = metavars_df,
+    vars_use = group.by.vars,
+    do_pca = FALSE,
+    npcs = 0,
+    theta = NULL, 
+    lambda = NULL,
+    sigma = 0.1, 
+    nclust = NULL,
+    tau = 0,
+    block.size = 0.05,
+    max.iter.harmony = 10,
+    max.iter.cluster = 20,
+    epsilon.cluster = 1e-5,
+    epsilon.harmony = 1e-4,
+    plot_convergence = FALSE,
+    return_object = TRUE,
+    verbose = TRUE, 
+    reference_values = NULL,
+)
+
+harmonyEmbed <- t(as.matrix(harmonyObject$Z_corr))
+rownames(harmonyEmbed) <- row.names(embedding)
+colnames(harmonyEmbed) <- paste0("harmony", "_", seq_len(ncol(harmonyEmbed)))
+
+harmonyClusters <- t(harmonyObject$R)
+rownames(harmonyClusters) <- row.names(embedding)
+colnames(harmonyClusters) <- paste0('R', seq_len(ncol(harmonyClusters)))
+
+harmonydata <- Seurat::CreateDimReducObject(
+  embeddings = harmonyEmbed,
+  stdev = as.numeric(apply(harmonyEmbed, 2, stats::sd)),
+  assay = "RNA",
+  key = "harmony",
+  misc=list(R=harmonyClusters))
+
+vivo[["harmony"]] <- harmonydata
+```
+
+## Build Reference
+```{r}
+vivo <- JoinLayers(vivo)
+
+dim <- 50
+k <- 30
+mind <- 0.3
+
+vivo[['umap']] <- RunUMAP2(Embeddings(vivo, 'harmony')[, 1:dim],
+                          n.neighbors = k,
+                          min.dist = mind,
+                          spread = 0.5,
+                          metric = "manhattan",
+                          assay='RNA', verbose=TRUE, umap.method='uwot',
+                          reduction.key = "umap_",
+                          return.model=TRUE)
+```
+
+```{r}
+vivo.ref <- buildReferenceFromSeurat(vivo, verbose = TRUE, save_umap = TRUE, 
+                                    save_uwot_path='vivo_cache_symphony.uwot')
+
+vivo.ref$normalization_method = 'log(CP10k+1)'
+```
+
+## Map query
+```{r}
+lem.count <- CreateSeuratObject(counts=LayerData(lem, assay = "RNA", layer = "counts"), meta.data=lem@meta.data) %>% 
+  subset(stage %in% c("9", "23", "35"))
+
+lem.count$batch <- "Sekiya"
+```
+
+```{r}
+que <- mapQuery(
+    exp_query = lem.count[["RNA"]]$counts, 
+    metadata_query = lem.count@meta.data, 
+    ref_obj = vivo.ref,
+    vars = "batch",
+    verbose = TRUE, 
+    do_normalize = TRUE,
+    do_umap = TRUE,
+    sigma = 0.05,
+    return_type = 'Seurat'
+)
+```
+
+```{r}
+que <- knnPredict.Seurat(que, vivo.ref, "cell_type", confidence = TRUE)
+```
+
+## Plot
+```{r}
+x.min <- (vivo@reductions$umap.harmony@cell.embeddings[,1] %>% min())-0.5
+x.max <- (vivo@reductions$umap.harmony@cell.embeddings[,1] %>% max())+0.5
+y.min <- (vivo@reductions$umap.harmony@cell.embeddings[,2] %>% min())-0.5
+y.max <- (vivo@reductions$umap.harmony@cell.embeddings[,2] %>% max())+0.5
+
+g <- bind_cols(vivo@meta.data,vivo@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=cell_type))
+p.vivo <- g +
+  geom_point(shape=16,size=0.3) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_manual(values = mypal[70:length(mypal)]) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0))
+p.vivo
+
+ggsave(plot=p.vivo, filename="plot/vivo.png",
+       width=6, height=6, limitsize = FALSE)
+```
+
+```{r}
+g <- bind_cols(que@meta.data,que@reductions$umap@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=Color_Level1))
+p <- g +
+  geom_point(shape=16,size=1) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_identity() + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0))
+p
+ggsave(plot=p, filename="plot/query.lvl1.png",
+       width=6, height=6, limitsize = FALSE)
+```
+
+```{r}
+vivo %>% saveRDS("WholeEmbryo.Atlas.rds")
+```
+
+
+
+
+
+
+
+
+

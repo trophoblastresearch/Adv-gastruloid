@@ -1,0 +1,701 @@
+---
+title: "Cell-cell communication"
+output: html_notebook
+---
+
+# Library
+```{r}
+library(reticulate)
+reticulate::use_python("/opt/homebrew/Caskroom/miniforge/base/envs/cellchat/bin/python",required = T)
+reticulate::py_config()
+library(CellChat)
+```
+
+```{r}
+library(tidyverse)
+
+library(Seurat)
+
+library(ggsci)
+library(viridis)
+
+options(stringsAsFactors = FALSE)
+library(NMF)
+
+library(patchwork)
+library(ggalluvial)
+library(ggupset)
+library(ggridges)
+library(lemon)
+```
+
+```{r}
+library(Lignature)
+```
+
+```{r}
+"%not.in%" <- Negate("%in%")
+
+mypal <- c(pal_jco("default")(10),
+           pal_startrek("uniform")(7),
+           pal_flatui("default")(10),
+           pal_frontiers("default")(10),
+           pal_cosmic("hallmarks_light")(10),
+           pal_npg("nrc")(10),
+           pal_aaas("default")(10),
+           pal_nejm("default")(8),
+           pal_lancet("lanonc")(9),
+           pal_ucscgb("default")(26),
+           pal_d3("category20")(20),
+           pal_observable("observable10")(10),
+           pal_igv("default")(51),
+           pal_rickandmorty("schwifty")(12)) %>% unlist() %>% unique()
+```
+
+# CellChatDB
+## Load Data
+```{r}
+d0 <- readRDS("D9-35.rds")
+d0 <- d0 %>% subset(subset = batch %in% c("Day0"))
+d0[["percent.mt"]] <- PercentageFeatureSet(d0, pattern = "^MT-")
+d0[["percent.ribo"]] <- PercentageFeatureSet(d0, pattern = "^RP[SL]")
+VlnPlot(d0,features=c("nFeature_RNA","nCount_RNA","percent.mt","percent.ribo"),ncol=4,pt.size=0.1,alpha=0.01) & 
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_blank() 
+  )
+
+d0 <- NormalizeData(d0)
+d0 <- FindVariableFeatures(d0,nfeatures=2000)
+all.genes <- rownames(d0)
+d0 <- ScaleData(d0, features=all.genes)
+d0 <- RunPCA(d0)
+```
+
+```{r}
+d0.ps.sub <- d0 %>% 
+  subset(subset = Origin.cell.type %in% c("PSC")) %>% 
+  subset(downsample = 320)
+d0.nm.sub <- d0 %>% 
+  subset(subset = Origin.cell.type %in% c("NMLC")) %>% 
+  subset(downsample = 1600)
+d0.act <- merge(x=d0.ps.sub,y=d0.nm.sub) %>% JoinLayers()
+
+d0.act <- NormalizeData(d0.act)
+```
+
+## make cellchat object
+## Set DB
+```{r}
+CellChatDB <- CellChatDB.human
+showDatabaseCategory(CellChatDB)
+```
+
+```{r}
+dplyr::glimpse(CellChatDB$interaction)
+```
+
+```{r}
+# use all CellChatDB except for "Non-protein Signaling" for cell-cell communication analysis
+CellChatDB.use <- subsetDB(CellChatDB)
+
+showDatabaseCategory(CellChatDB.use)
+```
+
+```{r}
+dplyr::glimpse(CellChatDB.use$interaction)
+```
+
+```{r}
+cellchat <- createCellChat(object = d0.act, group.by = "Origin.cell.type", assay = "RNA")
+groupSize <- as.numeric(table(cellchat@idents))
+groupSize
+# set the used database in the object
+cellchat@DB <- CellChatDB.use
+```
+
+# Preprocessing
+```{r}
+# subset the expression data of signaling genes for saving computation cost
+cellchat <- subsetData(cellchat) # This step is necessary even if using the whole database
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+```
+
+# Compute the communication probability 
+```{r}
+cellchat <- computeCommunProb(cellchat, type = "triMean", population.size = TRUE)
+```
+
+```{r}
+cellchat <- rankNetPairwise(cellchat)
+tri.en.int <- identifyEnrichedInteractions(
+  object=cellchat,
+  from="NMLC",
+  to="PSC",
+  bidirection = FALSE,
+  pair.only = TRUE,
+  pairLR.use0 = NULL,
+  thresh = 0.05
+)
+
+nrow(tri.en.int)
+
+subsetCommunication(cellchat.tri,sources.use = NULL, targets.use = NULL, thresh = 0.05) %>% nrow()
+```
+
+## signaling pathway level
+```{r}
+cellchat <- computeCommunProbPathway(cellchat)
+```
+
+## Calculate the aggregated cell-cell communication network
+```{r}
+cellchat <- aggregateNet(cellchat)
+```
+
+```{r}
+cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+
+netAnalysis_signalingRole_network(cellchat, signaling = pathways.show, width = 8, height = 2.5, font.size = 10)
+```
+
+```{r}
+selectK(cellchat, pattern = "outgoing")
+```
+
+```{r}
+nPatterns = 2
+cellchat <- identifyCommunicationPatterns(cellchat, pattern = "outgoing", k = nPatterns)
+```
+
+```{r}
+netAnalysis_river(cellchat, pattern = "outgoing")
+```
+
+```{r}
+netAnalysis_dot(cellchat, pattern = "outgoing")
+```
+
+```{r}
+selectK(cellchat, pattern = "incoming")
+```
+
+```{r}
+nPatterns = 2
+cellchat <- identifyCommunicationPatterns(cellchat, pattern = "incoming", k = nPatterns)
+```
+
+```{r}
+netAnalysis_river(cellchat, pattern = "incoming")
+```
+
+```{r}
+cellchat <- computeNetSimilarity(cellchat, type = "functional")
+cellchat <- netEmbedding(cellchat, type = "functional")
+#> Manifold learning of the signaling networks for a single dataset
+cellchat <- netClustering(cellchat, type = "functional")
+#> Classification learning of the signaling networks for a single dataset
+# Visualization in 2D-space
+p <- netVisual_embedding(cellchat, type = "functional", label.size = 2)
+p
+
+rankSimilarity(cellchat, type = "functional")
+```
+
+```{r}
+cellchat <- computeNetSimilarity(cellchat, type = "structural")
+cellchat <- netEmbedding(cellchat, type = "structural")
+#> Manifold learning of the signaling networks for a single dataset
+cellchat <- netClustering(cellchat, type = "structural")
+#> Classification learning of the signaling networks for a single dataset
+# Visualization in 2D-space
+netVisual_embedding(cellchat, type = "structural", label.size = 3.5)
+```
+
+```{r}
+netVisual_embeddingZoomIn(cellchat, type = "functional", nCol = 2)
+```
+
+## save
+```{r}
+saveRDS(cellchat, file = "CCDB_Results/Day0.CC.rds")
+
+cellchat <- readRDS("CCDB_Results/Day0.CC.rds")
+```
+
+# Data extraction
+```{r}
+cellchat <- rankNetPairwise(cellchat)
+
+en.int <- identifyEnrichedInteractions(
+  object=cellchat,
+  from="NMLC",
+  to="PSC",
+  bidirection = FALSE,
+  pair.only = TRUE,
+  pairLR.use0 = NULL,
+  thresh = 0.05
+)
+
+LR_interactions <- subsetCommunication(cellchat,sources.use = NULL, targets.use = NULL, thresh = NULL)
+LR_interactions %>% nrow()
+
+LR_detailed <- extractEnrichedLR(cellchat, signaling = pathways.show, geneLR.return = TRUE)
+```
+
+```{r}
+array_to_long <- function(cc.object) {
+  
+  result_df <- data.frame()
+  
+  prob_array <- cc.object@net$prob
+  pval_array <- cc.object@net$pval
+  
+  pathway_names <- dimnames(prob_array)[[3]]
+  cell_types <- rownames(prob_array)
+  
+  for(p in 1:dim(prob_array)[3]) {
+    
+    prob_slice <- prob_array[,,p] %>% 
+      melt(varnames = c("source", "target"), value.name = "probability")
+    
+    pval_slice <- pval_array[,,p] %>% 
+      melt(varnames = c("source", "target"), value.name = "pvalue")
+    
+    melted_df <- inner_join(prob_slice,pval_slice, by=c("source","target"))
+    
+    melted_df$interaction <- pathway_names[p]
+    
+    
+    result_df <- rbind(result_df, melted_df)
+  }
+  
+  result_df <- result_df %>% 
+    as_tibble() %>% 
+    mutate(source=as.character(source),
+           target=as.character(target))
+  
+  return(result_df)
+}
+```
+
+```{r}
+int.results <- array_to_long(cellchat)
+int.results %>% nrow()
+
+int.results %>% 
+  filter(probability>0) %>% 
+  filter(pvalue < 0.05) %>% 
+  arrange(desc(probability)) %>% View()
+
+db.names <- cellchat@DB$interaction %>% as_tibble() %>% 
+  select("interaction"=interaction_name,
+         "pathway"=pathway_name,
+         ligand,
+         receptor,
+         annotation,
+         "interaction_name"=interaction_name_2,
+         evidence)
+
+int.filt <- int.results %>% 
+  left_join(db.names) %>% 
+  filter(probability>0) %>% 
+  filter(pvalue <= 0.05) %>% 
+  arrange(desc(probability))
+
+int.filt %>% View()
+```
+
+```{r}
+netp <- tibble()
+for(p in 1:length(cellchat@netP$pathways)) {
+  
+  prob_slice <- cellchat@netP$prob[,,p] %>% 
+    melt(varnames = c("source", "target"), value.name = "pathway_proba")
+  
+  prob_slice$pathway <- dimnames(cellchat@netP$prob)[[3]][p]
+  
+  netp <- bind_rows(netp,as_tibble(prob_slice)) %>% 
+    mutate(source=as.character(source),
+           target=as.character(target))
+}
+
+netp
+
+int.filt <- int.filt %>% left_join(netp, by=c("source", "target", "pathway"))
+int.filt %>% View()
+```
+
+## NMLC outgoing signals
+```{r}
+dat <- int.filt %>% 
+  mutate(direction=paste0(source,"->",target)) %>% 
+  group_by(interaction) %>%
+  summarize(directions = list(direction))
+```
+
+```{r}
+nmtoes <- dat %>% 
+  filter(directions %>% map_lgl(~ all(! .x %in% c("PSC->PSC","PSC->NMLC")))) %>%
+  filter(directions != c("NMLC->NMLC"))
+
+g <- int.filt %>% 
+  mutate(direction=paste0(source,"->",target)) %>% 
+  filter(interaction %in% nmtoes$interaction) %>% 
+  filter(direction != "NMLC->NMLC") %>% 
+  group_by(pathway) %>% 
+  summarise(information_flow=sum(probability)) %>% 
+  ggplot(aes(x=reorder(pathway,information_flow),y=information_flow))
+p <- g + 
+  geom_bar(stat="identity",position="dodge",width=0.7) +
+  theme_classic() + 
+  theme(
+    aspect.ratio = 1/3,
+    plot.title = element_text(color="black",size=9),
+    panel.grid.major = element_blank(),
+    axis.line = element_line(linewidth = 0.2),
+    axis.tic = element_line(linewidth = 0.2),
+    axis.title.x = element_text(color="black",size=9),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(color="black",size=8,angle=90,hjust = 1, vjust=0.5),
+    axis.text.y = element_text(color="black",size=8)
+  ) + 
+  scale_x_discrete(limits=rev) +
+  scale_y_continuous(expand = c(0,0)) + 
+  ggtitle(paste0("outgoing from ","NMLC","(D0)"))
+
+p
+
+ggsave(plot=p,
+       filename=paste0("CCDB_Results/Flow_NMtoPS.svg"),
+       width=4, height=3,limitsize = FALSE)
+
+int.filt %>% 
+  mutate(direction=paste0(source,"->",target)) %>% 
+  filter(interaction %in% nmtoes$interaction) %>% 
+  filter(direction != "NMLC->NMLC") %>% 
+  group_by(pathway) %>% 
+  summarise(information_flow=sum(probability)) %>% 
+  arrange(-information_flow)
+```
+
+```{r}
+int.filt %>% 
+  mutate(direction=paste0(source,"->",target)) %>% 
+  filter(interaction %in% nmtoes$interaction) %>% 
+  arrange(desc(probability)) %>% 
+  View()
+```
+
+## PSC outgoing signals
+```{r}
+estonm <- dat %>% 
+  filter(directions %>% map_lgl(~ all(! .x %in% c("NMLC->PSC","NMLC->NMLC")))) %>%
+  filter(directions != c("PSC->PSC"))
+
+g <- int.filt %>% 
+  mutate(direction=paste0(source,"->",target)) %>% 
+  filter(interaction %in% estonm$interaction) %>% 
+  filter(direction != "PSC->PSC") %>% 
+  group_by(pathway) %>% 
+  summarise(information_flow=sum(probability)) %>% 
+  ggplot(aes(x=reorder(pathway,information_flow),y=information_flow))
+p <- g + 
+  geom_bar(stat="identity",position="dodge",width=0.7) +
+  theme_classic() + 
+  theme(
+    aspect.ratio = 3,
+    plot.title = element_text(color="black",size=9),
+    panel.grid.major = element_blank(),
+    axis.line = element_line(linewidth = 0.2),
+    axis.ticks = element_blank(),
+    axis.title.x = element_text(color="black",size=9),
+    axis.title.y = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(color="black",size=8)
+  ) + 
+  coord_flip() + 
+  scale_y_continuous(expand = c(0,0)) + 
+  ggtitle(paste0("outgoing from ","PSC","(D0)"))
+
+p
+
+ggsave(plot=p,
+       filename=paste0("CCDB_Results/Flow_PStoNM.svg"),
+       width=3, height=5,limitsize = FALSE)
+
+```
+
+```{r}
+int.filt %>% 
+  mutate(direction=paste0(source,"->",target)) %>% 
+  filter(interaction %in% estonm$interaction) %>% 
+  arrange(desc(probability)) %>% 
+  View()
+```
+
+# Lignature
+## Load source data
+```{r}
+load("LignatureData/siglist.RData")
+load("LignatureData/sigmeta.RData")
+load("LignatureData/lr_network_hg.RData")
+lr_network = unique(as.matrix(lr_network)[,c("L", "Lgene", "R", "Rgene")])
+load("LignatureData/mykegg_10500.RData")
+```
+
+```{r}
+dplyr::glimpse(siglist)
+```
+
+```{r}
+dplyr::glimpse(sigmeta)
+```
+
+```{r}
+dplyr::glimpse(lr_network)
+```
+
+## Group signatures by treatment ligands
+```{r}
+siggroupsoutput = groupSigs(siglist = siglist, sigmeta = sigmeta)
+sigLs = siggroupsoutput$sigLs
+siggroups = siggroupsoutput$siggroups
+
+siggroups
+```
+
+## Load seurat data
+```{r}
+eem <- readRDS("D0-6.rds")
+d1 <- subset(eem, subset = Day %in% c(1))
+```
+
+```{r}
+eem.01 <- merge(x=d0,y=d1 ,
+                add.cell.ids=c("D0","D1"))
+eem.01 <- JoinLayers(eem.01)
+
+eem.01 <- CreateSeuratObject(counts=LayerData(eem.01, assay = "RNA", layer = "counts"), meta.data=eem.01@meta.data)
+eem.01[["RNA"]] <- split(eem.01[["RNA"]], f = eem.01$batch)
+```
+
+```{r}
+eem.01@meta.data %>% group_by(Day,Origin.cell.type) %>% summarise(Count=n())
+```
+
+```{r}
+eem.01 <- NormalizeData(eem.01)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+eem.01.cc <- JoinLayers(eem.01)
+eem.01.cc <- CellCycleScoring(eem.01.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = eem.01.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(eem.01.cc)
+
+eem.01 <- AddMetaData(eem.01, metadata = cc.score)
+
+eem.01 <- FindVariableFeatures(eem.01,nfeatures = 3000)
+eem.01 <- ScaleData(eem.01, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+eem.01 <- RunPCA(eem.01)
+```
+
+```{r}
+eem.01 <- JoinLayers(eem.01)
+Idents(eem.01) <- "orig.ident"
+```
+
+```{r}
+eem.01@meta.data <- eem.01@meta.data %>% 
+    mutate(cond=paste0("Day",Day))
+```
+
+```{r}
+conds = c("Day1", "Day0") 
+condpairs = matrix(c("Day1", "Day0"), ncol = 2)
+colnames(condpairs) = c("cond1", "cond2")
+```
+
+```{r}
+allcls = unique(eem.01@meta.data$Origin.cell.type)
+allcls
+```
+
+## get Lignature score
+```{r}
+exprinfo = getExprInfo(seuratobj = eem.01, cls = allcls, conds = conds, condpairs = condpairs) 
+```
+
+```{r}
+exprinfo$DElist
+```
+
+```{r}
+mysiglist = getMySigs(DElist = exprinfo$DElist, cls = allcls, condpairs = condpairs, keggnodes = mykegg,
+                      pctcut = 0.1, belowpctcut = "lowpct.remove", testdegpadjcut = 1)
+```
+
+```{r}
+mysiglist %>% saveRDS("mySigList.rds")
+```
+
+```{r}
+LRIscorelist = getLRIScore(lr_network = lr_network, exprinfo = exprinfo, LRI.method = "cpdb")
+```
+
+```{r}
+LRIscorelist %>% saveRDS("CPDBscorelist.rds")
+```
+
+```{r}
+cl_to = "`PSC"
+condpair = "Day1_vs_Day0"
+sigscorelist = getSigScore(siglist = siglist, testsig = mysiglist[[cl_to]][[condpair]], whichsig = "lfc", 
+                           method = "cor.pearson", nump = 1000, corpby.permu = FALSE)
+
+sigscorelist
+```
+
+```{r}
+sigscorelist %>% saveRDS("D1PSC_SigScoreList.rds")
+```
+
+```{r}
+Lscoredf = getLScore(siggroups = siggroups, lr_network = lr_network, sigscorelist = sigscorelist, pvalcut = 100)
+Lscoredf
+```
+
+```{r}
+Lscoredf %>% 
+    rownames_to_column("ligand") %>% 
+    write_tsv("D1PSC_LigScore.txt")
+```
+
+```{r}
+LRinfolist = getLRinfosummary(exprinfo = exprinfo, LRIscorelist = LRIscorelist, Lscoredf = Lscoredf, lr_network = lr_network, 
+                              cl_to = cl_to, condpair = condpair)
+```
+
+```{r}
+LRinfolist %>% saveRDS("LRinfolist.rds")
+```
+
+```{r}
+getScatterLRpairs(LRinfolist = LRinfolist, cls_from = allcls, cl_to = cl_to, Lscore.by = "Lscore_signed_maxabs", SLRI.by = "SLRI_condmax",
+                  point.size = 3, Lscore.cut = 0.1, SLRI.cut = 0.3)
+```
+
+## Plot
+```{r}
+load("Source/sigmeta.RData")
+sigmeta %>% select(sig_id,Ligand)
+```
+
+```{r}
+sigscorelist <- readRDS("D1PSC_SigScoreList.rds")
+
+sigscorelist %>% View()
+
+sigscore <- tibble(
+  sig_id = names(sigscorelist$score),
+  LigScore = sigscorelist$score,
+  LigPval = sigscorelist$pvalue,
+)
+
+sigscore %>% arrange(-LigScore) %>% View()
+
+sigscore %>% nrow()
+sigscore %>% filter(LigPval<0.05) %>% nrow()
+
+adjp <- p.adjust(sigscore$LigPval, method = "bonferroni", n = length(sigscore$LigPval))
+
+sigscore <- sigscore %>% mutate(LigPadj=adjp)
+
+sigscore <- sigscore %>% 
+  left_join(sigmeta %>% select(sig_id,Ligand))
+
+sigscore <- sigscore %>% 
+  select(Ligand,everything())
+
+sigscore %>% View()
+```
+
+```{r}
+Lscoredf <- read_tsv("D1PSC_LigScore.txt")
+
+Lscoredf %>% View()
+
+Lscoredf.max <- Lscoredf %>% 
+  select(ligand,
+         max_abs,
+         sign_maxabs,
+         sig_max_abs)
+
+Lscoredf.max <- Lscoredf.max %>% 
+  left_join(sigscore %>% 
+              select("sig_max_abs"=sig_id,
+                     "max_abs_adjp"=LigPadj))
+  
+Lscoredf.max <- Lscoredf.max %>% 
+  mutate(signed_max_abs=max_abs*sign_maxabs)
+
+Lscoredf.max %>% View()
+```
+
+```{r}
+eem.01.p <- AggregateExpression(eem.01, assays = "RNA", return.seurat = T, group.by = c("orig.ident"))
+
+Lexp <- FetchData(eem.01,
+                  vars = c(LRIscorelist$score$NMLC_to_PSC$L %>% unique(),
+                           "orig.ident"),
+                  layer="data")
+
+Lexp <- Lexp %>% 
+  pivot_longer(-orig.ident ,values_to = "expression", names_to = "ligand")
+
+Lexp.sum <- Lexp %>% 
+  group_by(orig.ident,ligand) %>% 
+  summarise(LigExpMean=mean(expression),
+            LigExpFrac=sum(expression>0, na.rm = TRUE)/n()*100)
+
+Lexp.D0NM <- Lexp.sum %>% 
+  filter(orig.ident == "Day0_NMLC")
+```
+
+```{r}
+LRIscorelist <- readRDS("CPDBscorelist.rds")
+
+LRI.max <- LRIscorelist$score$NMLC_to_PSC %>% group_by(L) %>% filter(SLRI_Day0==max(SLRI_Day0)) %>% ungroup()
+LRI.max <- LRI.max %>% 
+  select("ligand"=L,
+         LRIscore=SLRI_Day0)
+
+dat <- LRI.max %>% left_join(Lscoredf.max) %>% left_join(Lexp.D0NM)
+
+g <- dat %>% 
+  filter(!is.na(signed_max_abs)) %>% 
+  filter(max_abs_adjp < 0.05) %>% 
+  ggplot(aes(x=signed_max_abs,y=LRIscore,size=LigExpFrac,fill=LigExpMean,text=ligand))
+p <- g + 
+  geom_point(alpha=0.7,shape=21, color="black") +
+  theme_classic() + 
+  theme(
+    aspect.ratio = 1
+  ) + 
+  scale_fill_gradientn(colors=rev(viridis_pal(option="rocket")(15)[6:15])) + 
+  scale_size_continuous(limits = c(0,100),breaks = seq(20,100,20),range=c(0,10)) +
+  scale_y_continuous(expand=c(0.02,0.02)) + 
+  scale_x_continuous(limits = c(0,0.6),expand=c(0,0))
+  
+p
+
+ggsave(plot=p,
+       filename=paste0("plot/LN+CPDB.svg"),
+       width=5, height=5,limitsize = FALSE)
+
+```
+
+

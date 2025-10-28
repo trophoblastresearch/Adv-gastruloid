@@ -1,0 +1,349 @@
+---
+title: "D0-6 Cell type annotation"
+output: html_notebook
+---
+
+# Library
+```{r}
+library(tidyverse)
+library(data.table)
+library(lemon)
+library(Seurat)
+library(SeuratWrappers)
+library(ggsci)
+library(viridis)
+library(RColorBrewer)
+library(scCustomize)
+
+"%not.in%" <- Negate("%in%")
+
+mypal <- c(pal_jco("default")(10),
+           pal_startrek("uniform")(7),
+           pal_flatui("default")(10),
+           pal_frontiers("default")(10),
+           pal_cosmic("hallmarks_light")(10),
+           pal_npg("nrc")(10),
+           pal_aaas("default")(10),
+           pal_nejm("default")(8),
+           pal_lancet("lanonc")(9),
+           pal_ucscgb("default")(26),
+           pal_d3("category20")(20),
+           pal_observable("observable10")(10),
+           pal_igv("default")(51),
+           pal_rickandmorty("schwifty")(12)) %>% unlist() %>% unique()
+
+pal <- viridis(n = 10, option = "D")
+```
+
+# Load Data
+```{r}
+eem <- readRDS("D0-6.rds")
+eem[["RNA"]] <- split(eem[["RNA"]], f = eem$batch)
+```
+
+# Normalization ~ PCA
+```{r}
+eem <- NormalizeData(eem)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+eem.cc <- JoinLayers(eem)
+eem.cc <- CellCycleScoring(eem.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = eem.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(eem.cc)
+
+eem <- AddMetaData(eem, metadata = cc.score)
+
+eem <- FindVariableFeatures(eem,nfeatures = 3000)
+eem <- ScaleData(eem, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+eem <- RunPCA(eem)
+
+DimPlot(eem, reduction = "pca", group.by = c("orig.ident","Phase")) +
+  theme_classic() & 
+    theme(
+      aspect.ratio = 1,
+    ) &
+  scale_color_manual(values=mypal) & 
+  guides(colour = guide_legend(override.aes = list(size=4)))
+```
+
+# UMAP w/o integration
+```{r}
+eem <- RunUMAP(eem,
+                  dims = 1:50, 
+                  reduction = "pca",
+                  reduction.name = "umap.pca", 
+                  n.neighbors = 30,
+                  min.dist = 0.3, 
+                  spread=0.5,
+                  metric = "manhattan")
+
+p <- DimPlot(eem, reduction = "umap.pca", group.by = c("orig.ident"),pt.size = 1) +
+  theme_classic() & 
+    theme(
+      aspect.ratio = 1,
+      plot.title = element_blank(),
+    ) &
+  scale_color_manual(values=mypal) & 
+  guides(colour = guide_legend(override.aes = list(size=4))) & 
+  xlab("UMAP_1") & 
+  ylab("UMAP_2")
+p
+#plotly::ggplotly(p)
+```
+
+# Harmony integration
+```{r}
+set.seed(0)
+
+eem.i <- IntegrateLayers(
+  object = eem, method = HarmonyIntegration, assay = "RNA",
+  nclust=2, theta = 2, lambda = 200,
+  orig.reduction = "pca", new.reduction = "harmony", verbose = FALSE)
+```
+
+```{r}
+dim <- 50
+k <- 20
+mind <- 0.5
+
+eem.i <- RunUMAP(eem.i,
+                  dims = 1:dim, 
+                  reduction = "harmony",
+                  reduction.name = "umap.harmony", 
+                  n.neighbors = k,
+                  min.dist = mind, 
+                  spread=0.5,
+                  metric = "manhattan")
+```
+
+# Clustering
+```{r}
+eem.i <- FindNeighbors(eem.i, reduction = "harmony", dims = 1:50, k.param = 5, nn.method = "annoy", annoy.metric = "manhattan")
+eem.i <- FindClusters(eem.i, resolution = 0.8, cluster.name = "harmony_clusters")
+```
+
+# Marker genes
+```{r}
+eem.i <- JoinLayers(eem.i)
+markers <- FindAllMarkers(eem.i, only.pos = TRUE)
+
+markers %>% 
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  top_n(p_val_adj,n=-20)
+
+markers %>% 
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  filter(p_val_adj < 0.01) %>% 
+  filter(pct.1 > 0.1) %>% 
+  write_tsv("EEM_Results/Cluster_Markers.txt")
+```
+
+# annotation
+```{r}
+anno <- read_tsv("EEM_Results/Cluster_Markers_Selected.modi.txt")
+
+anno.clust <- anno %>% 
+  group_by(cluster,CellType) %>% 
+  summarise() %>% 
+  ungroup() %>% 
+  mutate(cluster=str_extract(cluster,"(?<=^C)\\d*")) %>% 
+  dplyr::rename("Annotation"=CellType)
+  
+meta <- tibble(
+  cell=Cells(eem.i),
+  cluster=eem.i$harmony_clusters) %>% 
+  left_join(anno.clust) %>% 
+  select(-cluster) %>% 
+  column_to_rownames("cell") 
+
+eem.i <- eem.i %>% AddMetaData(metadata = meta)
+```
+
+# Plot
+## Annotation
+```{r}
+g <- bind_cols(eem.i@meta.data,eem.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=Annotation))
+
+p <- g +
+  geom_point(shape=16,size=1.5) +
+  theme_void() + 
+  theme(
+    aspect.ratio = 1,
+    legend.position = "none") +
+  scale_color_manual(values=mypal[1:length(mypal)]) + 
+  guides(colour = guide_legend(override.aes = list(size=4)))
+p
+
+ggsave(plot=p, 
+       filename=paste0("EEM_Plot/","Annotation_NoLeg.png"), 
+       width=6, height=6, limitsize = FALSE)
+```
+
+## Origin.cell.type
+```{r}
+g <- bind_cols(eem.i@meta.data,eem.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=Origin.cell.type))
+
+p <- g +
+  geom_point(shape=16,size=1.5) +
+  theme_void() + 
+  theme(
+    aspect.ratio = 1,
+    legend.position = "none") +
+  scale_color_manual(values=c("#7CB342","#3949AB")) + 
+  guides(colour = guide_legend(override.aes = list(size=4)))
+p
+
+ggsave(plot=p, 
+       filename=paste0("EEM_Plot/","Origin_NoLeg.png"), 
+       width=6, height=6, limitsize = FALSE)
+```
+
+## Day
+```{r}
+g <- bind_cols(eem.i@meta.data,eem.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  mutate(Day=ifelse(!is.na(Day),Day,"Unassigned")) %>% 
+  arrange(desc(Day)) %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=Day))
+
+p <- g +
+  geom_point(shape=16,size=1.5) +
+  theme_void() + 
+  theme(
+    aspect.ratio = 1,
+    legend.position = "none") +
+  scale_color_manual(values=c(viridis_pal(option="inferno")(12)[c(1,4,6,8,10,11)],"grey90")) + 
+  guides(colour = guide_legend(override.aes = list(size=4)))
+p
+
+ggsave(plot=p, 
+       filename=paste0("EEM_Plot/","Day0-6_NoLeg.png"), 
+       width=6, height=6, limitsize = FALSE)
+```
+
+## Dot Plot
+```{r}
+list <- unique(anno$CellType)
+
+marker <- anno %>% 
+  distinct(gene, .keep_all = T) %>% 
+  group_by(CellType) %>% 
+  ungroup()
+
+eem.i@meta.data <- eem.i@meta.data %>% 
+  dplyr::mutate(Annotation=fct_relevel(as_factor(Annotation),list))
+
+p <- DotPlot(subset(eem.i,subset=Annotation %not.in% c("Undefined")), 
+             features = marker$gene , group.by = "Annotation") & 
+  scale_color_gradientn(colors=rev(viridis_pal(option="rocket")(15)[6:15])) &
+  scale_y_discrete(limits=rev) & 
+  scale_x_discrete() & 
+  theme(
+    axis.text.x = element_text(angle = 90,hjust=1,vjust=0.5)
+  )
+p
+
+ggsave(plot=p,
+       filename=paste0("EEM_Plot/","DotPlotV2.svg"),
+       width=14, height=4.8,limitsize = FALSE)
+```
+
+## Feature Plot
+```{r}
+pal <- rev(viridis_pal(option="rocket")(15)[6:15])
+genes <- read_tsv("EEM_Results/Cluster_Markers_Selected.modi.txt")
+
+for(i in 1:nrow(genes)){
+  mark <- genes$gene[i]
+  p <- FeaturePlot_scCustom(seurat_object = eem.i, num_columns = 1,
+                            features = genes$gene[i], colors_use = pal, na_color = "grey90",
+                            reduction = "umap.harmony", order=TRUE, pt.size = 3) & 
+    theme_void() & 
+    theme(
+      legend.position = "none",
+      aspect.ratio = 1,
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      plot.title = element_text(hjust = 0.05, vjust=-3, family="Helvetica", face = "italic", size = 40)
+      )
+  
+  ggsave(plot=p, 
+         filename=paste0("EEM_Plot/Features/",mark,".png"),
+         width=5, height=5, limitsize = FALSE)
+}
+```
+
+# AIP
+```{r}
+eem.end <- eem.i %>% subset(subset = Annotation %in% c("Endo-2"))
+
+pal <- rev(viridis_pal(option="rocket")(15)[6:15])
+genes <- c("SHH","HHEX","NPY","ANKRD1","APELA","RIPPLY3","MYL7","TGFB2","ADGRG6","TNNI1","ID3","TNNT2","MYH6","MMP11","NPPB","ROBO2","TPM1","MDK","BAMBI","HAPLN1","FZD7","HBZ","KRT19","NDUFA4L2","FAM162A","DDIT4","KRT8","FLRT2","STMN1","MYL4","H3-3B","FN1","ACTC1","HBG2","TUBA1A","HBG1","TLE5","TUBB2B","AHSP","SLC25A37","PKM","KRT18","CSRP2","EMC10","HES1","CD24","MARCKSL1","CCDC34","BCAS3","FOXA2","GYPC","ONECUT1","GATA4","TBX2","TBX3","NKX2-5","FGF8","NRP1","FBLN7","KIRREL3","VTN") %>% unique()
+
+for(i in 1:length(genes)){
+  mark <- genes[i]
+  p <- FeaturePlot_scCustom(seurat_object = eem.end, num_columns = 1, label = F,
+                            features = genes[i], colors_use = pal, na_color = "grey90",
+                            reduction = "umap.harmony", order=TRUE, pt.size = 3) & 
+    theme_void() & 
+    theme(
+      legend.position = "none",
+      aspect.ratio = 1.3,
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      plot.title = element_blank()
+      ) & 
+  scale_x_continuous(limits = c(3.75,8.22))
+  
+  ggsave(plot=p, 
+         filename=paste0("AIP/features/",i,".",mark,".png"),
+         width=5, height=5, limitsize = FALSE)
+}
+
+```
+
+```{r}
+p <- Plot_Density_Joint_Only(seurat_object = eem.end, 
+                             features = c("SHH", "HHEX"), 
+                             reduction = "umap.harmony",
+                             pt.size = 4) &
+    theme_void() & 
+    theme(
+      #legend.position = "none",
+      aspect.ratio = 1,
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      plot.title = element_blank()
+      ) & 
+    scale_x_continuous(limits = c(3.75,8.22)) & 
+  scale_color_viridis(option = "rocket", direction = -1, breaks=seq(0,1.2,0.4))
+
+p
+
+ggsave(plot=p, 
+       filename=paste0("AIP/Density/SHH.HHEX.png"),
+       width=5, height=5, limitsize = FALSE)
+```
+
+
+
+
+
+

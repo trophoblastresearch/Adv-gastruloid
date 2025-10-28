@@ -1,0 +1,361 @@
+---
+title: "HuEM Projection tool"
+output: html_notebook
+---
+
+# Setting
+```{r setup, include=FALSE, echo=FALSE}
+require("knitr")
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "HuEm_stable_reference_projection_tool")
+getwd()
+```
+
+# Library
+```{r}
+library(tidyverse)
+
+library(miloR)
+library(SingleCellExperiment)
+
+library(scater)
+library(scran)
+library(igraph)
+
+library(batchelor)
+library(uwot)
+
+library(Seurat)
+
+library(kernlab)
+library(caret)
+
+library(ggsci)
+library(viridis)
+library(lemon)
+library(ggalluvial)
+```
+
+```{r}
+"%not.in%" <- Negate("%in%")
+
+mypal <- c(pal_jco("default")(10),
+           pal_startrek("uniform")(7),
+           pal_flatui("default")(10),
+           pal_frontiers("default")(10),
+           pal_cosmic("hallmarks_light")(10),
+           pal_npg("nrc")(10),
+           pal_aaas("default")(10),
+           pal_nejm("default")(8),
+           pal_lancet("lanonc")(9),
+           pal_ucscgb("default")(26),
+           pal_d3("category20")(20),
+           pal_observable("observable10")(10),
+           pal_igv("default")(51),
+           pal_rickandmorty("schwifty")(12)) %>% unlist() %>% unique()
+
+pal <- viridis(n = 10, option = "D")
+```
+
+# Load function
+```{r}
+source("main.function.R")
+```
+
+# Predict and Project EEM by Day
+```{r}
+eem <-  readRDS("D0-6.rds")
+eem <- JoinLayers(eem)
+eem <- CreateSeuratObject(counts=LayerData(eem, assay = "RNA", layer = "counts"), meta.data=eem@meta.data)
+
+eem$orig.dataset <- "Sekiya"
+eem$stage <- eem$Day
+#eem$batch <- eem$orig.dataset
+
+colmap <- tibble(
+  Annotation = eem$Annotation %>% unique() %>% sort(),
+  Annotation.color = mypal[1:21]
+)
+
+meta <- tibble(
+  cells = Cells(eem),
+  Annotation = eem$Annotation
+) %>% 
+  left_join(colmap) %>% 
+  select(cells,Annotation.color) %>% 
+  column_to_rownames("cells")
+
+eem <- eem %>% AddMetaData(metadata = meta)
+
+eem@meta.data <- eem@meta.data %>% 
+  mutate(orig.ident=paste0(Origin.cell.type,"_D",Day))
+```
+
+
+```{r}
+para.list <- list()
+para.list$cellGroup <- FALSE ## whether providing group information for cells
+para.list$runMiloR <- FALSE  ## whether run miloR aggregation 
+para.list$cor.cutoff <- 0.5 ## correlation cutoff
+ 
+predicted.eem <- list()
+
+for(d in unique(eem@meta.data$orig.ident)){
+  rm(temp.seu, temp.counts)
+  temp.seu <- subset(eem, subset = orig.ident %in% c(d))
+  temp.counts <- temp.seu[["RNA"]]$counts %>% as_tibble() %>% mutate(Genes=Features(eem)) %>% column_to_rownames("Genes")
+  
+  if (para.list$cellGroup) {
+    # If you want to run the miloR aggregation for each separate group (such as control or treated samples), you need to provide the group information for each cell. Otherwise 
+    temp.counts.meta <- read.delim(demo_cell_group_file_path ,head=F,stringsAsFactors = F,sep="\t") %>% tbl_df() %>% setNames(c("cell","group")) %>% mutate(pj="query",EML="query")
+  }else{
+    temp.counts.meta <- data.frame(cell=colnames(temp.counts)) %>% tbl_df() %>% mutate(cell=as.vector(cell)) %>% mutate(EML="query",group="None",pj="query")
+  }
+  
+  if (para.list$runMiloR) {
+    milo_out <- FunMiloCal(temp.counts,temp.counts.meta, temp.cal=TRUE)
+  }else{
+    milo_out <- FunMiloCal(temp.counts,temp.counts.meta, temp.cal=FALSE)
+  }
+  
+  sf_out <- FunCalSF(milo_out)
+  
+  sf_out$query.sce.cor.out <- FunCalCor(sf_out)
+  sf_out$query.sce.cor.out.mean <- sf_out$query.sce.cor.out %>% 
+    gather(ref_cell,cor,-query_cell) %>% 
+    group_by(query_cell) %>% 
+    top_n(20,cor) %>% 
+    summarise(cor_top_mean=mean(cor))
+  
+  sf_out$NWIN <- FunNWIN(sf_out)
+  
+  mnn.pairs.list <- list()
+  for (ref_name in c("SPH2016","D3post","Meistermann_2021","CS7","nBGuo","Yan2013")) {
+    print(ref_name)
+    mnn.pairs.list[[ref_name]] <-FunCalMNN_each(sf_out,ref_name)
+  }
+  
+  predict_out <-  FunProjCal(mnn.pairs.list,
+                             query.sce.ob=sf_out$query.sce.ob,
+                             query.sce.cor.out=sf_out$query.sce.cor.out,
+                             temp.max=sf_out$NWIN$temp.max,
+                             D2_umap_model=ref.umap,
+                             Dmulti_umap_model=ref_umap_nDim_model,
+                             cor.cutoff=0.5)
+  
+  predict_out$HS <- milo_out$HS
+  predict_out$raw.meta <- milo_out$raw.meta
+  predict_out$query.sce.cor.out.mean <- sf_out$query.sce.cor.out.mean
+  
+  predict_out <- FunPredAnno(predict_out,cor.cutoff=0.1)  
+  
+  query.meta <- tibble(cell=Cells(temp.seu)) %>% 
+    left_join(predict_out$full.anno %>% rename("cell"=query_cell,"psdt"=pred_psdt)) %>% 
+    left_join(predict_out$query.sce.cor.out.mean %>% rename("cell"=query_cell)) %>% 
+    column_to_rownames("cell")
+  temp.seu <- temp.seu %>% AddMetaData(query.meta)
+  
+  query.mnn <- tibble(cell=Cells(temp.seu)) %>% 
+    left_join(predict_out$query.pca %>% as_tibble() %>% mutate(cell=rownames(predict_out$query.pca))) %>% 
+    column_to_rownames("cell")
+  temp.seu[["mnn"]] <- CreateDimReducObject(embeddings = as.matrix(query.mnn), key = "mnn_", assay = DefaultAssay(temp.seu))
+  
+  query.umap <- tibble(cell=Cells(temp.seu)) %>% 
+    left_join(predict_out$umap %>% as_tibble()) %>%
+    select(cell,UMAP_1,UMAP_2) %>% 
+    column_to_rownames("cell")
+  temp.seu[["UMAP"]] <- CreateDimReducObject(embeddings = as.matrix(query.umap), key = "UMAP_", assay = DefaultAssay(temp.seu))
+  
+  predicted.eem[[paste0(d)]] <- temp.seu
+
+}
+
+predicted.eem
+```
+
+```{r}
+predicted.eem.merged <- merge(x=predicted.eem[[1]],y=predicted.eem[2:length(predicted.eem)])
+```
+
+```{r}
+query.mnn <- tibble()
+query.umap <- tibble()
+
+for(seu in predicted.eem){
+  
+  temp.mnn <- seu@reductions$mnn@cell.embeddings %>% 
+    as_tibble() %>% 
+    mutate(cell=Cells(seu))
+  
+  query.mnn <- bind_rows(query.mnn,temp.mnn)
+  
+  temp.umap <- seu@reductions$UMAP@cell.embeddings %>% 
+    as_tibble() %>% 
+    mutate(cell=Cells(seu))
+  
+  query.umap <- bind_rows(query.umap,temp.umap)
+    
+}
+
+query.mnn.mat <- tibble(cell=Cells(predicted.eem.merged)) %>% 
+  left_join(query.mnn) %>%
+  select(cell,everything()) %>% 
+  column_to_rownames("cell") %>% 
+  as.matrix()
+
+predicted.eem.merged[["mnn"]] <- CreateDimReducObject(embeddings = query.mnn.mat, key = "mnn_", assay = DefaultAssay(predicted.eem.merged))
+
+query.umap.mat <- tibble(cell=Cells(predicted.eem.merged)) %>% 
+  left_join(query.umap) %>%
+  select(cell,everything()) %>% 
+  column_to_rownames("cell") %>% 
+  as.matrix()
+
+predicted.eem.merged[["UMAP"]] <- CreateDimReducObject(embeddings = query.umap.mat, key = "UMAP_", assay = DefaultAssay(predicted.eem.merged))
+```
+
+```{r}
+predicted.eem.merged %>% saveRDS("Zhao_MNN_Results/EEM_Projection.rds")
+```
+
+# Plot
+```{r}
+predicted.eem <- readRDS("Zhao_MNN_Results/EEM_Projection.rds")
+zhao <- readRDS("Zhao/6Refs.rds")
+```
+
+## Reference
+```{r}
+p <- DimPlot(zhao, reduction = 'UMAP', group.by = c("rename_EML"), shuffle = TRUE, label = T, pt.size = 1) & 
+  scale_color_manual(values=mypal) & 
+  theme_void() & 
+  theme(
+    aspect.ratio = 1,
+    legend.position = "none",
+    plot.title = element_blank()
+  ) &
+  scale_color_manual(values=mypal[65:length(mypal)])
+p
+
+ggsave(plot=p, 
+       filename=paste0("Zhao/ReferenceLab.png"),
+       width=6, height=6, limitsize = FALSE)
+```
+
+```{r}
+p <- DimPlot(zhao, reduction = 'UMAP', group.by = c("rename_EML"), shuffle = TRUE, label = T, pt.size = 2) & 
+  scale_color_manual(values=mypal) & 
+  theme_void() & 
+  theme(
+    aspect.ratio = 0.859375,
+    legend.position = "none",
+    plot.title = element_blank()
+  ) &
+  scale_color_manual(values=mypal[65:length(mypal)]) &
+  scale_x_continuous(limits=c(-13,2),expand=c(0,0)) & 
+  scale_y_continuous(limits=c(-3.8,9),expand=c(0,0))
+p
+
+ggsave(plot=p, 
+       filename=paste0("Zhao/Reference_ZoomLab.png"),
+       width=6, height=6, limitsize = FALSE)
+```
+
+## Projection
+```{r}
+dat <- bind_rows(
+  bind_cols(
+    zhao@meta.data %>% as_tibble() %>% mutate(cell=Cells(zhao)),
+    zhao@reductions$UMAP@cell.embeddings %>% as_tibble()
+  ),
+  bind_cols(
+    predicted.eem@meta.data %>% as_tibble() %>% mutate(cell=Cells(predicted.eem)),
+    predicted.eem@reductions$UMAP@cell.embeddings %>% as_tibble()
+  )
+) %>% 
+  filter(!is.na(orig.dataset)) %>% 
+  filter(!is.na(Day)) %>% 
+  mutate(Origin.cell.type=fct_relevel(as_factor(Origin.cell.type),c("PSC","NMLC")))
+
+dat %>% group_by(orig.ident) %>% 
+  do(Cor_quantile = quantile(.$cor_top_mean)) %>%
+  cbind(do.call(rbind, .$Cor_quantile)) %>%
+  select(-Cor_quantile) %>% 
+  ungroup() %>% 
+  mutate(IQR=`75%`-`25%`) %>% 
+  mutate(l.whisker=`25%`-(1.5*IQR))
+```
+
+```{r}
+th <- 0.4836452
+
+dat <- bind_rows(
+  bind_cols(
+    zhao@meta.data %>% as_tibble() %>% mutate(cell=Cells(zhao)),
+    zhao@reductions$UMAP@cell.embeddings %>% as_tibble()
+  ),
+  bind_cols(
+    predicted.eem@meta.data %>% as_tibble() %>% mutate(cell=Cells(predicted.eem)),
+    predicted.eem@reductions$UMAP@cell.embeddings %>% as_tibble()
+  )
+) %>% 
+  filter(!is.na(orig.dataset)) %>% 
+  filter(!is.na(Day)) %>% 
+  mutate(Origin.cell.type=fct_relevel(as_factor(Origin.cell.type),c("PSC","NMLC")))
+
+dat %>% 
+  mutate(Cor=ifelse(cor_top_mean>=th,"Pass","Low")) %>% 
+  filter(!is.na(Cor)) %>% 
+  group_by(Origin.cell.type, Day, Cor, .drop = F) %>% 
+  summarise(Count=n()) %>% 
+  ungroup() %>% 
+  pivot_wider(values_from = Count, names_from = Cor, values_fill=0) %>% 
+  mutate(Percent=Pass*100/(Low+Pass))
+```
+
+```{r}
+dat <- bind_rows(
+  bind_cols(
+    zhao@meta.data %>% as_tibble() %>% mutate(cell=Cells(zhao)),
+    zhao@reductions$UMAP@cell.embeddings %>% as_tibble()
+  ),
+  bind_cols(
+    predicted.eem@meta.data %>% as_tibble() %>% mutate(cell=Cells(predicted.eem)),
+    predicted.eem@reductions$UMAP@cell.embeddings %>% as_tibble()
+  ) %>% filter(cor_top_mean>=th)
+)
+
+for(ident in unique(predicted.eem@meta.data$orig.ident)){
+  
+  g <- dat %>% 
+    filter(orig.ident %in% c(ident,"SeuratProject")) %>% 
+    mutate(DataType=ifelse(!is.na(orig.dataset),"Query","Reference")) %>% 
+    ggplot(aes(x=UMAP_1,y=UMAP_2,colour=DataType))
+  
+  p <- g +
+    geom_point(shape=16,size=2.5) +
+    theme_void() + 
+    theme(aspect.ratio = 0.859375,
+          legend.position = "none") +
+    scale_color_manual(values=c("red","grey90")) + 
+    guides(colour = guide_legend(override.aes = list(size=4))) +
+    scale_x_continuous(limits=c(-13,2),expand=c(0.01,0.01)) +
+    scale_y_continuous(limits=c(-3.8,9),expand=c(0.01,0.01))
+  p
+  
+  ggsave(plot=p, 
+         filename=paste0("Zhao_MNN_Results/Day_Cor.D4Q3/",ident,".png"),
+         width=6, height=6, limitsize = FALSE)
+
+  }
+```
+
+```{r}
+predicted.eem@meta.data %>% 
+  as_tibble() %>% 
+  mutate(Cells=Cells(predicted.eem)) %>% 
+  select(Cells,pred_EML,sub_pred_EML,stage,prediction_score_max,psdt,cor_top_mean) %>% 
+  bind_cols(predicted.eem@reductions$UMAP@cell.embeddings) %>% 
+  write_tsv("Zhao_MNN_Results/Results.txt")
+```
+

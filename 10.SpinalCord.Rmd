@@ -1,0 +1,1141 @@
+---
+title: "Spinal Cord"
+output: html_notebook
+---
+
+# Library
+```{r}
+library(tidyverse)
+library(data.table)
+library(lemon)
+library(Seurat)
+library(SeuratWrappers)
+library(ggsci)
+library(viridis)
+library(amap)
+library(directlabels)
+library(scCustomize)
+library(ggalluvial)
+
+"%not.in%" <- Negate("%in%")
+
+mypal <- c(pal_jco("default")(10),
+           pal_startrek("uniform")(7),
+           pal_flatui("default")(10),
+           pal_frontiers("default")(10),
+           pal_cosmic("hallmarks_light")(10),
+           pal_npg("nrc")(10),
+           pal_aaas("default")(10),
+           pal_nejm("default")(8),
+           pal_lancet("lanonc")(9),
+           pal_ucscgb("default")(26),
+           pal_d3("category20")(20),
+           pal_observable("observable10")(10),
+           pal_igv("default")(51),
+           pal_rickandmorty("schwifty")(12)) %>% unlist() %>% unique()
+```
+
+# Load Data
+```{r}
+lem <- readRDS("D9-35.rds")
+
+ect <- subset(lem, subset = Annotation_Level1 %in% c("Neural prog.","Neuron","Neural crest"))
+ect <- CreateSeuratObject(counts=LayerData(dat.ect, assay = "RNA", layer = "counts"), meta.data=dat.ect@meta.data)
+ect[["RNA"]] <- split(ect[["RNA"]], f = ect$Day)
+
+ect <- NormalizeData(ect)
+ect <- FindVariableFeatures(ect,nfeatures = 3000)
+ect <- ScaleData(ect, vars.to.regress = c("nCount_RNA","percent.mt","S.Score","G2M.Score"))
+ect <- RunPCA(ect)
+```
+
+# Harmony integration
+```{r}
+ect.i <- IntegrateLayers(
+  object = ect, method = HarmonyIntegration, assay = "RNA", theta=1.5,
+  orig.reduction = "pca", new.reduction = "harmony", verbose = FALSE)
+```
+
+```{r}
+dim <- 50
+k <- 50
+mind <- 0.3
+
+ect.i <- RunUMAP(ect.i,
+                      dims = 1:dim, 
+                      reduction = "harmony",
+                      reduction.name = "umap.harmony", 
+                      n.neighbors = k,
+                      min.dist = mind, 
+                      spread=0.5,
+                      metric = "manhattan")
+```
+
+# Clustering
+```{r}
+ect.i <- FindNeighbors(ect.i, reduction = "harmony", dims = 1:50, k.param = 5, nn.method = "annoy", annoy.metric = "manhattan")
+ect.i <- FindClusters(ect.i, resolution = 0.7, cluster.name = "harmony_clusters")
+```
+
+# Find Markers
+```{r}
+ect.i <- JoinLayers(ect.i)
+
+markers <- FindAllMarkers(ect.i, only.pos = TRUE)
+
+markers %>% 
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  top_n(p_val_adj,n=-20)
+
+markers %>% 
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  filter(p_val_adj < 0.05) %>% 
+  write_tsv("Level2/Ectoderm_culsters_markers.txt")
+```
+
+# Annotation
+```{r}
+anno <- read_tsv("Level2/Ectoderm_culsters_annotation.txt")
+
+meta <- meta %>% left_join(anno)
+
+meta <- meta %>% select(Clusters_Level2,Annotation_Level2,Color_Level2) %>% 
+  mutate(cells=Cells(ect.i)) %>% column_to_rownames("cells")
+
+ect.i <- AddMetaData(ect.i,metadata=meta)
+```
+
+# Plot
+## Day
+```{r}
+pal <- c(viridis_pal(option="magma")(12)[c(11,8,6)])
+
+g <- bind_cols(ect.i@meta.data,ect.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,color=Day))
+p <- g +
+  geom_point(shape=16,size=2) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_manual(values=pal)
+p
+ggsave(plot=p, filename="Level2/Plot/Ectoderm_Day.png",
+       width=6, height=6, limitsize = FALSE)
+```
+
+## Origin
+```{r}
+g <- bind_cols(ect.i@meta.data,ect.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=Origin.cell.type))
+p <- g +
+  geom_point(shape=16,size=2) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_manual(values=c("#7CB342","#3949AB"))
+p
+ggsave(plot=p, filename="Level2/Plot/Ectoderm_Origin.png",
+       width=6, height=6, limitsize = FALSE)
+```
+
+## Annotation
+### All
+```{r}
+g <- bind_cols(ect.i@meta.data,ect.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=Color_Level2))
+p <- g +
+  geom_point(shape=16,size=2) +
+  theme_void() + 
+  theme(
+    #legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_identity()
+p
+ggsave(plot=p, filename="Level2/Plot/Ectoderm_lvl2.png",
+       width=6, height=6, limitsize = FALSE)
+```
+
+### Neural prog.
+```{r}
+g <- bind_cols(ect.i@meta.data,ect.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  mutate(Color_Level2=ifelse(Annotation_Level2 %in% c("Roof plate","Neural prog-1","Neural prog-2","Neural prog-3","Floor plate","Pre-neural crest"),Color_Level2,"grey90")) %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=Color_Level2))
+p <- g +
+  geom_point(shape=16,size=1.5) +
+  theme_void() + 
+  theme(
+    #legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_identity()
+p
+ggsave(plot=p, filename="Level2/Plot/Ectoderm_Prog.png",
+       width=6, height=6, limitsize = FALSE)
+```
+
+## Feature plot
+```{r}
+pro <- ect.i %>% subset(subset = Annotation_Level2 %in% c("Roof plate","Neural prog-1","Neural prog-2","Neural prog-3","Floor plate","Pre-neural crest"))
+
+pal <- rev(viridis_pal(option="rocket")(15)[6:15])
+markers <- read_tsv("SpinalCord/Progenitor_subtype_markers.txt") %>% 
+  separate_rows(Genes, sep=", ")
+
+genes <- markers$Genes %>% unique()
+genes <- na.omit(genes)
+
+genes <- c(genes,"SOX2")
+
+for(i in 1:length(genes)){
+  mark <- genes[i]
+  p <- FeaturePlot_scCustom(seurat_object = pro, num_columns = 1, label = F,
+                            features = genes[i], colors_use = pal, na_color = "grey90",
+                            reduction = "umap.harmony", order=TRUE, pt.size = 3) & 
+    theme_void() & 
+    theme(
+      legend.position = "none",
+      aspect.ratio = 1.2,
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      plot.title = element_blank()
+      ) &  
+    scale_x_continuous(expand=c(0,0),limits=c(-0.4,4.2)) &
+    scale_y_continuous(expand=c(0,0),limits=c(-1.5,3.5))
+    
+  
+  ggsave(plot=p, 
+         filename=paste0("SpinalCord/Progenitor_features/",i,".",mark,".png"),
+         width=5, height=5, limitsize = FALSE)
+}
+```
+
+## Dot plot
+```{r}
+level_order <- c("C3","C0","C2","C9","C10","C12","C7","C19","C18","C20","C17","C6","C16","C8","C14","C1","C5","C11","C4","C15","C13","C21")
+
+selected <- read_tsv("Level2/Ectoderm_culsters_markers_selected.txt")
+
+ect.i@meta.data <- ect.i@meta.data %>% 
+  dplyr::mutate(Clusters_Level2=fct_relevel(as_factor(Clusters_Level2),level_order))
+
+p <- DotPlot(subset(ect.i, subset = Clusters_Level2 %not.in% c("C17","C6","C16","C8","C14","C1","C5","C11","C4","C15","C13","C21")), 
+             features = unique(selected$gene), group.by = "Clusters_Level2") & 
+  scale_color_gradientn(colors=rev(viridis_pal(option="rocket")(15)[6:15])) &
+  scale_y_discrete(limits=rev) & 
+  scale_x_discrete() & 
+  theme(
+    axis.text.x = element_text(angle = 90,hjust=1,vjust=0.5)
+  )
+p
+
+ggsave(plot=p, filename="Level2/Plot/Ectoderm.prog_crest.Dot.svg",
+       width=10, height=3.2, limitsize = FALSE)
+```
+
+```{r}
+ect.i %>% saveRDS("Level2/Ectoderm.rds")
+```
+
+# Atlas projection
+## Progenitor
+### Reference data
+```{r}
+sc.all <- readRDS("SpinalCord/Rayon.rds")
+
+sc <- sc.all %>% 
+  subset(subset = authors_annotation %in% c("Progenitor")) %>% 
+  subset(subset = authors_annotation_sub %not.in% c("Null_Progenitor")) %>% 
+  subset(subset = harmony_clusters %in% c("0"))
+
+sc <- NormalizeData(sc)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+sc.cc <- JoinLayers(sc)
+sc.cc <- CellCycleScoring(sc.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = sc.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(sc.cc)
+
+sc <- AddMetaData(sc, metadata = cc.score)
+
+sc <- FindVariableFeatures(sc,nfeatures = 3000)
+sc <- ScaleData(sc, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"), block.size=2000)
+sc <- RunPCA(sc)
+```
+
+### HarmonyMatrix
+```{r}
+embedding <- Seurat::Embeddings(sc, reduction = "pca")
+
+dims.use <- seq_len(ncol(embedding))
+
+metavars_df <- Seurat::FetchData(sc, names(sc@meta.data))
+group.by.vars <- c("batch")
+
+set.seed(0)
+harmonyObject = harmony::HarmonyMatrix(
+    data_mat = embedding,
+    meta_data = metavars_df,
+    vars_use = group.by.vars,
+    do_pca = FALSE,
+    npcs = 0,
+    theta = 2, 
+    lambda = NULL,
+    sigma = 0.1, 
+    nclust = NULL,
+    tau = 0,
+    block.size = 0.05,
+    max.iter.harmony = 10,
+    max.iter.cluster = 20,
+    epsilon.cluster = 1e-5,
+    epsilon.harmony = 1e-4,
+    plot_convergence = FALSE,
+    return_object = TRUE,
+    verbose = TRUE, 
+    reference_values = NULL,
+)
+
+harmonyEmbed <- t(as.matrix(harmonyObject$Z_corr))
+rownames(harmonyEmbed) <- row.names(embedding)
+colnames(harmonyEmbed) <- paste0("harmony", "_", seq_len(ncol(harmonyEmbed)))
+
+harmonyClusters <- t(harmonyObject$R)
+rownames(harmonyClusters) <- row.names(embedding)
+colnames(harmonyClusters) <- paste0('R', seq_len(ncol(harmonyClusters)))
+
+harmonydata <- Seurat::CreateDimReducObject(
+  embeddings = harmonyEmbed,
+  stdev = as.numeric(apply(harmonyEmbed, 2, stats::sd)),
+  assay = "RNA",
+  key = "harmony",
+  misc=list(R=harmonyClusters))
+
+sc[["harmony"]] <- harmonydata
+```
+
+### Build Reference
+```{r}
+sc <- JoinLayers(sc)
+
+dim <- 50
+k <- 10
+mind <- 0.4
+
+sc[['umap']] <- RunUMAP2(Embeddings(sc, 'harmony')[, 1:dim],
+                          n.neighbors = k,
+                          min.dist = mind,
+                          spread = 0.5,
+                          metric = "manhattan",
+                          assay='RNA', verbose=TRUE, umap.method='uwot',
+                          reduction.key = "umap_",
+                          return.model=TRUE)
+```
+
+```{r}
+sc.ref <- buildReferenceFromSeurat(sc, verbose = TRUE, save_umap = TRUE, 
+                                    save_uwot_path='SpinalCord/Prog_cache_symphony.uwot')
+
+sc.ref$normalization_method = 'log(CP10k+1)'
+```
+
+### Map query
+```{r}
+ect <-  readRDS("Level2/Ectoderm.rds")
+ect <- JoinLayers(ect)
+ect <- CreateSeuratObject(counts=LayerData(ect, assay = "RNA", layer = "counts"), meta.data=ect@meta.data)
+
+ect$orig.dataset <- "Sekiya"
+ect$batch <- ect$Day
+
+prog <- ect %>% subset(subset = Annotation_Level2 %in% c("Roof plate","Neural prog-1","Neural prog-2","Neural prog-3","Floor plate"))
+```
+
+```{r}
+que <- mapQuery(
+    exp_query = prog[["RNA"]]$counts, 
+    metadata_query = prog@meta.data, 
+    ref_obj = sc.ref,
+    vars = "batch",
+    verbose = TRUE, 
+    do_normalize = TRUE,
+    do_umap = TRUE,
+    sigma = 0.5,
+    return_type = 'Seurat'
+)
+```
+
+```{r}
+que <- knnPredict.Seurat(que, sc.ref, "authors_annotation_sub", confidence = TRUE)
+```
+
+```{r}
+pred <- que@meta.data %>% as_tibble() %>% 
+  mutate(cells=Cells(que)) %>% 
+  column_to_rownames("cells") %>% 
+  select("Predicted_label"=authors_annotation_sub,
+         "Predicted_label_prob"=authors_annotation_sub_prob)
+
+prog <- prog %>% AddMetaData(metadata = pred)
+```
+
+### Plot
+```{r}
+sc.col <- tibble(
+  authors_annotation_sub = c("RP","dp1","dp2","dp3","dp4","dp5","dp6","p0","p1","p2","pMN","p3","FP"),
+  annot.color = mypal[1:(1+length(unique(sc$authors_annotation_sub))-1)]
+  )
+
+dat <- bind_rows(
+  bind_cols(sc@meta.data,sc@reductions$umap@cell.embeddings) %>% left_join(sc.col) %>% mutate(Data = "Atlas"),
+  bind_cols(que@meta.data,que@reductions$umap@cell.embeddings) %>% mutate(Data = "EmbryoModel")
+) %>% 
+  as_tibble() %>% 
+  mutate(authors_annotation_sub = fct_relevel(as_factor(authors_annotation_sub),c("RP","dp1","dp2","dp3","dp4","dp5","dp6","p0","p1","p2","pMN","p3","FP")))
+
+x.min <- (sc@reductions$umap@cell.embeddings[,1] %>% min())-0.5
+x.max <- (sc@reductions$umap@cell.embeddings[,1] %>% max())+0.5
+y.min <- (sc@reductions$umap@cell.embeddings[,2] %>% min())-0.5
+y.max <- (sc@reductions$umap@cell.embeddings[,2] %>% max())+0.5
+```
+
+```{r}
+g <- dat %>% 
+  mutate(annot.dataset.color=ifelse(is.na(authors_annotation_sub),"grey90",authors_annotation_sub)) %>% 
+  sample_frac(size=1) %>% 
+  filter(Data=="Atlas") %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=authors_annotation_sub, text=authors_annotation_sub))
+p.ref <- g +
+  geom_point(shape=16,size=2) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_manual(values=viridis_pal(option="turbo")(length(unique(sc$authors_annotation_sub)))) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.ref
+
+ggsave(plot=p.ref, filename="SpinalCord/Progenitor.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+```{r}
+g <- dat %>% 
+  mutate(Color_Level2=ifelse(is.na(Color_Level2),"grey90",Color_Level2)) %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.dataset=fct_relevel(as_factor(orig.dataset),c("Rayon","Sekiya"))) %>% 
+  arrange(orig.dataset) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=Color_Level2, size=Data))
+p.que <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_identity() + 
+  scale_size_manual(values = c(2,2)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.que
+
+ggsave(plot=p.que, filename="SpinalCord/Progenitor_Query.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+```{r}
+g <-  dat %>% 
+  mutate(Prediction=ifelse(is.na(authors_annotation_sub_prob),NA,as.character(authors_annotation_sub))) %>% 
+  mutate(Prediction = fct_relevel(as_factor(Prediction),c("RP","dp1","dp2","dp3","dp4","dp5","dp6","p0","p1","p2","pMN","p3","FP"))) %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.dataset=fct_relevel(as_factor(orig.dataset),c("Rayon","Sekiya"))) %>% 
+  arrange(orig.dataset) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=Prediction, size=Data))
+p.que <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_manual(values=viridis_pal(option="turbo")(length(c("RP","dp1","dp2","dp3","dp4","dp5","dp6","p0","p1","p2","pMN","p3","FP"))), na.value = "grey90") + 
+  scale_size_manual(values = c(2,2)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.que
+
+ggsave(plot=p.que, filename="SpinalCord/Progenitor_Pred.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+```{r}
+al.dat <- que@meta.data %>% 
+  as_tibble() %>% 
+  mutate(cells=Cells(que)) %>% 
+  group_by(Annotation_Level2,authors_annotation_sub) %>% 
+  summarise(freq=n()) %>% 
+  ungroup() %>% 
+  mutate(
+    Annotation_Level2=fct_relevel(as_factor(Annotation_Level2),c("Roof plate","Neural prog-1","Neural prog-2","Neural prog-3","Floor plate")),
+    authors_annotation_sub=fct_relevel(as_factor(authors_annotation_sub),c("RP","dp1","dp2","dp3","dp4","dp5","dp6","p0","p1","p2","pMN","p3","FP"))
+  ) %>% 
+  arrange(Annotation_Level2,authors_annotation_sub)
+  
+p <- ggplot(data = al.dat,
+       aes(axis1 = Annotation_Level2,   # First variable on the X-axis
+           axis2 = authors_annotation_sub,
+           y = freq)) +
+  geom_alluvium(aes(fill = Annotation_Level2)) +
+  geom_stratum() +
+  geom_text(stat = "stratum",
+            aes(label = after_stat(stratum))) +
+  theme_void() + 
+  theme(
+    legend.position = "none"
+  ) + 
+  scale_fill_manual(values = c("#EFD500FF","#BDC3C7FF","#7C878EFF","#6F286AFF","#00AF66FF"))
+p  
+
+ggsave(plot=p, filename="SpinalCord/Progenitor_Annot_Pred.svg",
+       width=3.5, height=8, limitsize = FALSE)
+```
+
+```{r}
+sub <- read_tsv("SpinalCord/Progenitor_subtype_markers.txt") %>% 
+  separate_rows(Genes, sep=", ")
+
+all.mark <- sub$Genes %>% unique()
+
+list <- all.mark
+
+que@meta.data <- que@meta.data %>% 
+  dplyr::mutate(authors_annotation_sub=fct_relevel(as_factor(authors_annotation_sub),c("RP","dp1","dp2","dp3","dp4","dp5","dp6","p0","p1","p2","pMN","p3","FP")))
+
+p <- DotPlot(que, 
+             features = unique(list), group.by = "authors_annotation_sub",
+             scale.by = "size") & 
+  scale_color_gradientn(colors=rev(viridis_pal(option="rocket")(15)[6:15])) &
+  scale_y_discrete(limits=rev) & 
+  scale_x_discrete() & 
+  theme(
+    axis.text.x = element_text(angle = 90,hjust=1,vjust=0.5)
+  )
+p
+
+ggsave(plot=p, filename="SpinalCord/Progenitor_Marker_bySymphony.svg",
+       width=8, height=3.7, limitsize = FALSE)
+```
+
+## Neuron
+### Reference data
+```{r}
+sc.all <- readRDS("SpinalCord/Rayon.rds")
+
+sc <- sc.all %>% 
+  subset(subset = authors_annotation %in% c("Neuron")) %>% 
+  subset(subset = authors_annotation_sub %not.in% c("Null_Neuron")) %>% 
+  subset(subset = harmony_clusters %in% c("0"))
+
+sc <- NormalizeData(sc)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+sc.cc <- JoinLayers(sc)
+sc.cc <- CellCycleScoring(sc.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = sc.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(sc.cc)
+
+sc <- AddMetaData(sc, metadata = cc.score)
+
+sc <- FindVariableFeatures(sc,nfeatures = 3000)
+sc <- ScaleData(sc, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"), block.size=2000)
+sc <- RunPCA(sc)
+```
+
+### HarmonyMatrix
+```{r}
+embedding <- Seurat::Embeddings(sc, reduction = "pca")
+
+dims.use <- seq_len(ncol(embedding))
+
+metavars_df <- Seurat::FetchData(sc, names(sc@meta.data))
+group.by.vars <- c("batch")
+
+set.seed(0)
+harmonyObject = harmony::HarmonyMatrix(
+    data_mat = embedding,
+    meta_data = metavars_df,
+    vars_use = group.by.vars,
+    do_pca = FALSE,
+    npcs = 0,
+    theta = 2, 
+    lambda = NULL,
+    sigma = 0.1, 
+    nclust = NULL,
+    tau = 0,
+    block.size = 0.05,
+    max.iter.harmony = 10,
+    max.iter.cluster = 20,
+    epsilon.cluster = 1e-5,
+    epsilon.harmony = 1e-4,
+    plot_convergence = FALSE,
+    return_object = TRUE,
+    verbose = TRUE, 
+    reference_values = NULL,
+)
+
+harmonyEmbed <- t(as.matrix(harmonyObject$Z_corr))
+rownames(harmonyEmbed) <- row.names(embedding)
+colnames(harmonyEmbed) <- paste0("harmony", "_", seq_len(ncol(harmonyEmbed)))
+
+harmonyClusters <- t(harmonyObject$R)
+rownames(harmonyClusters) <- row.names(embedding)
+colnames(harmonyClusters) <- paste0('R', seq_len(ncol(harmonyClusters)))
+
+harmonydata <- Seurat::CreateDimReducObject(
+  embeddings = harmonyEmbed,
+  stdev = as.numeric(apply(harmonyEmbed, 2, stats::sd)),
+  assay = "RNA",
+  key = "harmony",
+  misc=list(R=harmonyClusters))
+
+sc[["harmony"]] <- harmonydata
+```
+
+### Build Reference
+```{r}
+sc <- JoinLayers(sc)
+
+dim <- 40
+k <- 20
+mind <- 0.3
+
+sc[['umap']] <- RunUMAP2(Embeddings(sc, 'harmony')[, 1:dim],
+                          n.neighbors = k,
+                          min.dist = mind,
+                          spread = 0.5,
+                          metric = "manhattan",
+                          assay='RNA', verbose=TRUE, umap.method='uwot',
+                          reduction.key = "umap_",
+                          return.model=TRUE)
+```
+
+```{r}
+sc.ref <- buildReferenceFromSeurat(sc, verbose = TRUE, save_umap = TRUE, 
+                                    save_uwot_path='SpinalCord/Neuron_cache_symphony.uwot')
+
+sc.ref$normalization_method = 'log(CP10k+1)'
+```
+
+### Map query
+```{r}
+ect <-  readRDS("Level2/Ectoderm.rds")
+ect <- JoinLayers(ect)
+ect <- CreateSeuratObject(counts=LayerData(ect, assay = "RNA", layer = "counts"), meta.data=ect@meta.data)
+
+ect$orig.dataset <- "Sekiya"
+ect$stage <- ect$Day
+ect$batch <- ect$Day
+
+neu <- ect %>% subset(subset = Annotation_Level2 %in% c("Neuron-1","Neuron-2","Neuron-3","Neuron-4","Neuron-5","Neuron-6","Neuron-7","Neuron-8"))
+```
+
+```{r}
+que <- mapQuery(
+    exp_query = neu[["RNA"]]$counts, 
+    metadata_query = neu@meta.data, 
+    ref_obj = sc.ref,
+    vars = "batch",
+    verbose = TRUE, 
+    do_normalize = TRUE,
+    do_umap = TRUE,
+    sigma = 0.5,
+    return_type = 'Seurat'
+)
+```
+
+```{r}
+que <- knnPredict.Seurat(que, sc.ref, "authors_annotation_sub", confidence = TRUE)
+```
+
+```{r}
+pred <- que@meta.data %>% as_tibble() %>% 
+  mutate(cells=Cells(que)) %>% 
+  column_to_rownames("cells") %>% 
+  select("Predicted_label"=authors_annotation_sub,
+         "Predicted_label_prob"=authors_annotation_sub_prob)
+```
+
+### Plot
+```{r}
+sc.col <- tibble(
+  authors_annotation_sub = c("dl1","dl2","dl3","dl4","dl5","dl6","V0","V1","V2a","V2b","MN","V3"),
+  annot.color = mypal[1:(1+length(unique(sc$authors_annotation_sub))-1)]
+  )
+
+dat <- bind_rows(
+  bind_cols(sc@meta.data,sc@reductions$umap@cell.embeddings) %>% left_join(sc.col) %>% mutate(Data = "Atlas"),
+  bind_cols(que@meta.data,que@reductions$umap@cell.embeddings) %>% mutate(Data = "EmbryoModel")
+) %>% 
+  as_tibble() %>% 
+  mutate(authors_annotation_sub = fct_relevel(as_factor(authors_annotation_sub),c("dl1","dl2","dl3","dl4","dl5","dl6","V0","V1","V2a","V2b","MN","V3")))
+
+x.min <- (sc@reductions$umap@cell.embeddings[,1] %>% min())-0.5
+x.max <- (sc@reductions$umap@cell.embeddings[,1] %>% max())+0.5
+y.min <- (sc@reductions$umap@cell.embeddings[,2] %>% min())-0.5
+y.max <- (sc@reductions$umap@cell.embeddings[,2] %>% max())+0.5
+```
+
+```{r}
+g <- dat %>% 
+  mutate(annot.dataset.color=ifelse(is.na(authors_annotation_sub),"grey90",authors_annotation_sub)) %>% 
+  sample_frac(size=1) %>% 
+  filter(Data=="Atlas") %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=authors_annotation_sub, text=authors_annotation_sub))
+p.ref <- g +
+  geom_point(shape=16,size=2) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_manual(values=c(colors_discrete_friendly_long,colors_discrete_ibm)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.ref
+
+ggsave(plot=p.ref, filename="SpinalCord/Neuron.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+```{r}
+g <- dat %>% 
+  mutate(Color_Level2=ifelse(is.na(Color_Level2),"grey90",Color_Level2)) %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.dataset=fct_relevel(as_factor(orig.dataset),c("Rayon","Sekiya"))) %>% 
+  arrange(orig.dataset) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=Color_Level2, size=Data))
+p.que <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_identity() + 
+  scale_size_manual(values = c(2,2)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.que
+
+ggsave(plot=p.que, filename="SpinalCord/Neuron_Query.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+```{r}
+g <-  dat %>% 
+  mutate(Prediction=ifelse(is.na(authors_annotation_sub_prob),NA,as.character(authors_annotation_sub))) %>% 
+  mutate(Prediction = fct_relevel(as_factor(Prediction),c("dl1","dl2","dl3","dl4","dl5","dl6","V0","V1","V2a","V2b","MN","V3"))) %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.dataset=fct_relevel(as_factor(orig.dataset),c("Rayon","Sekiya"))) %>% 
+  arrange(orig.dataset) %>% 
+  ggplot(aes(x=umap_1,y=umap_2,colour=Prediction, size=Data))
+p.que <- g +
+  geom_point(shape=16) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1,
+    ) +
+  scale_color_manual(values=c(colors_discrete_friendly_long,colors_discrete_ibm), na.value = "grey90") + 
+  scale_size_manual(values = c(2,2)) + 
+  scale_x_continuous(limits = c(x.min,x.max), expand = c(0,0)) + 
+  scale_y_continuous(limits = c(y.min,y.max), expand = c(0,0)) +
+  xlab("UMAP_1") + 
+  ylab("UMAP_2")
+p.que
+
+ggsave(plot=p.que, filename="SpinalCord/Neuron_Pred.png",
+       width=5, height=5, limitsize = FALSE)
+```
+
+```{r}
+al.dat <- que@meta.data %>% 
+  as_tibble() %>% 
+  mutate(cells=Cells(que)) %>% 
+  group_by(Annotation_Level2,authors_annotation_sub) %>% 
+  summarise(freq=n()) %>% 
+  ungroup() %>% 
+  mutate(
+    Annotation_Level2.2=paste0("Cl.",Annotation_Level2),
+    authors_annotation_sub.2=paste0("Pred.",authors_annotation_sub)
+  ) %>% 
+  mutate(
+    Annotation_Level2.2=fct_relevel(as_factor(Annotation_Level2.2),c("Neuron-1","Neuron-2","Neuron-3","Neuron-4","Neuron-5","Neuron-6","Neuron-7","Neuron-8")),
+    authors_annotation_sub.2=fct_relevel(as_factor(authors_annotation_sub.2),c("dl1","dl2","dl3","dl4","dl5","dl6","V0","V1","V2a","V2b","MN","V3"))
+  ) %>% 
+  arrange(Annotation_Level2,authors_annotation_sub)
+  
+p <- ggplot(data = al.dat,
+       aes(axis1 = Annotation_Level2.2,
+           axis2 = authors_annotation_sub.2,
+           y = freq)) +
+  geom_alluvium(aes(fill = Annotation_Level2.2)) +
+  geom_stratum() +
+  geom_text(stat = "stratum",
+            aes(label = after_stat(stratum))) +
+  theme_void() + 
+  theme(
+    legend.position = "none"
+  ) + 
+  scale_fill_manual(values = c("#31B7BCFF","#2980B9FF","#164194FF","#00B5E2FF","#007B3DFF","#C0392BFF","#16A085FF","#F39C12FF"))
+p  
+
+ggsave(plot=p, filename="SpinalCord/Neuron_Annot_Pred_Cor05.svg",
+       width=3.5, height=8, limitsize = FALSE)
+```
+
+```{r}
+sub <- read_tsv("SpinalCord/Neuron_subtype_markers.txt") %>% 
+  separate_rows(Genes, sep=", ")
+
+all.mark <- sub$Genes %>% unique()
+
+list <- all.mark
+
+que@meta.data <- que@meta.data %>% 
+  dplyr::mutate(authors_annotation_sub=fct_relevel(as_factor(authors_annotation_sub),c("dl1","dl2","dl3","dl4","dl5","dl6","V0","V1","V2a","V2b","MN","V3")))
+
+p <- DotPlot(que, 
+             features = unique(list), group.by = "authors_annotation_sub",
+             scale.by = "size") & 
+  scale_color_gradientn(colors=rev(viridis_pal(option="rocket")(15)[6:15])) &
+  scale_y_discrete(limits=rev) & 
+  scale_x_discrete() & 
+  theme(
+    axis.text.x = element_text(angle = 90,hjust=1,vjust=0.5)
+  )
+p
+
+ggsave(plot=p, filename="SpinalCord/Neuron_Marker_bySymphony.svg",
+       width=10, height=3.5, limitsize = FALSE)
+```
+
+# PCA
+## Data
+### Rayon
+```{r}
+sc <- readRDS("Rayon/SpinalCord.rds")
+
+sc@meta.data <- sc@meta.data %>% mutate(batch=paste0(stage,"_",tissue))
+sc <- JoinLayers(sc)
+sc <- CreateSeuratObject(counts=LayerData(sc, assay = "RNA", layer = "counts"), meta.data = sc@meta.data)
+sc[["RNA"]] <- split(sc[["RNA"]], f = sc$batch)
+
+sc <- NormalizeData(sc)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+sc.cc <- JoinLayers(sc)
+sc.cc <- CellCycleScoring(sc.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = sc.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(sc.cc)
+
+sc <- AddMetaData(sc, metadata = cc.score)
+
+sc <- FindVariableFeatures(sc,nfeatures = 3000)
+sc <- ScaleData(sc, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+sc <- RunPCA(sc)
+```
+
+```{r}
+sc <- IntegrateLayers(
+  object = sc, method = HarmonyIntegration, assay = "RNA",
+  theta=0.1,
+  orig.reduction = "pca", new.reduction = "harmony", verbose = FALSE)
+
+sc <- RunUMAP(sc,
+              dims = 1:40, 
+              reduction = "harmony",
+              reduction.name = "umap.harmony", 
+              n.neighbors = 20,
+              min.dist = 0.2, 
+              spread=0.5,
+              metric = "manhattan")
+```
+
+```{r}
+sc <- FindNeighbors(sc, reduction = "harmony", dims = 1:40, k.param = 20, nn.method = "annoy", annoy.metric = "manhattan")
+sc <- FindClusters(sc, resolution = 0.01, cluster.name = "harmony_clusters")
+```
+
+```{r}
+label <- tibble(
+  authors_annotation = c("Blood","DRG Progenitor","Erythrocytes","Erythrocytes II","Erythropoeitic","Hematopoeitic","Mesoderm I","Mesoderm II","Mesoderm III","Mesoderm IV","Mesoderm V","Mesoderm VI","Myoblast","NULL","Neural crest progenitor","Neuron","Oligodendrocyte","Peripheral neuron","Progenitor","Sensory neuron progenitor","Skin"),
+  label = c("Blood","PNS progenitor","Blood","Blood","Blood","Blood","Meosderm","Meosderm","Meosderm","Meosderm","Meosderm","Meosderm","Meosderm","NULL","PNS progenitor","CNS neuron","CNS Progenitor","PNS neuron","CNS Progenitor","PNS neuron","Skin")
+)
+
+meta <- tibble(
+  cells = Cells(sc),
+  authors_annotation = sc$authors_annotation
+) %>% 
+  left_join(label) %>% 
+  column_to_rownames("cells")
+
+sc <- sc %>% AddMetaData(metadata = meta)
+```
+
+```{r}
+sc.sub <- sc.all %>% subset(subset = authors_annotation %in% c("Neuron","Progenitor"))
+sc.sub@meta.data %>% group_by(authors_annotation,authors_annotation_sub,label) %>% summarise(n()) %>% View()
+```
+
+```{r}
+ray.neu.cs12 <- sc.sub %>% subset(subset = stage %in% c("CS12")) %>% subset(subset = harmony_clusters %in% c("0"))
+ray.neu.cs14 <- sc.sub %>% subset(subset = stage %in% c("CS14")) %>% subset(subset = harmony_clusters %in% c("0"))
+ray.neu.cs19 <- sc.sub %>% subset(subset = stage %in% c("CS19")) %>% subset(subset = harmony_clusters %in% c("0"))
+```
+
+### Xu, Zeng
+```{r}
+whole <- readRDS("WholeEmbryo.Atlas.rds")
+```
+
+```{r}
+whole <- FindNeighbors(whole, reduction = "harmony", dims = 1:50, k.param = 10, nn.method = "annoy", annoy.metric = "manhattan")
+whole <- FindClusters(whole, resolution = 0.3, cluster.name = "harmony_clusters")
+```
+
+```{r}
+whole <- JoinLayers(whole)
+
+xz.neu <- whole %>% subset(subset = cell_type %in% c("SC","Neuron")) %>% subset(subset = harmony_clusters %in% c("5","1","19"))
+xz.neu$label <- xz.neu$orig.ident
+
+ze.neu.cs10 <- xz.neu %>% subset(subset = orig.dataset %in% c("Zeng")) %>% subset(subset = stage %in% c("CS10"))
+ze.neu.cs12 <- xz.neu %>% subset(subset = orig.dataset %in% c("Zeng")) %>% subset(subset = stage %in% c("CS12"))
+ze.neu.cs13 <- xz.neu %>% subset(subset = orig.dataset %in% c("Zeng")) %>% subset(subset = stage %in% c("CS13-14"))
+xu.neu.cs12 <- xz.neu %>% subset(subset = orig.dataset %in% c("Xu")) %>% subset(subset = stage %in% c("CS12"))
+xu.neu.cs13 <- xz.neu %>% subset(subset = orig.dataset %in% c("Xu")) %>% subset(subset = stage %in% c("CS13-14"))
+xu.neu.cs15 <- xz.neu %>% subset(subset = orig.dataset %in% c("Xu")) %>% subset(subset = stage %in% c("CS15-16"))
+```
+
+### Adv-gastruloid
+```{r}
+eem <- readRDS("D0-6.rds")
+
+eem$orig.dataset <- "Sekiya"
+eem$stage <- eem$Day
+
+em.neu.d4 <- eem %>% subset(subset = Annotation %in% c("SC-1","SC-2","SC-3")) %>% subset(subset = Day %in% c("4"))
+em.neu.d6 <- eem %>% subset(subset = Annotation %in% c("SC-1","SC-2","SC-3")) %>% subset(subset = Day %in% c("6"))
+```
+
+```{r}
+em.neu.d9 <- ect %>% subset(subset = Annotation_Level1 %in% c("Neural tube","Neurons")) %>% subset(subset = Day %in% c("9"))
+em.neu.d23 <- ect %>% subset(subset = Annotation_Level1 %in% c("Neural tube","Neurons")) %>% subset(subset = Day %in% c("23"))
+em.neu.d35 <- ect %>% subset(subset = Annotation_Level1 %in% c("Neural tube","Neurons")) %>% subset(subset = Day %in% c("35"))
+```
+
+```{r}
+d9_2 <- readRDS("D9.Combi.rds")
+
+em.neu.d9_2 <- d9_2 %>% 
+  subset(subset = orig.ident %in% c("EM_ix2_Day9","EM_5x5_Day9")) %>% 
+  subset(subset = Annotation %in% c("Neural prog.","Neuron"))
+```
+
+## Merge
+```{r}
+em.neu.d4$orig.ident <- "em.neu.d4"
+em.neu.d6$orig.ident <- "em.neu.d6"
+em.neu.d9$orig.ident <- "em.neu.d9"
+em.neu.d9_2$orig.ident <- "em.neu.d9"
+em.neu.d23$orig.ident <- "em.neu.d23"
+em.neu.d35$orig.ident <- "em.neu.d35"
+
+ze.neu.cs10$orig.ident <- "ze.neu.cs10"
+ze.neu.cs12$orig.ident <- "ze.neu.cs12"
+ze.neu.cs13$orig.ident <- "ze.neu.cs13"
+xu.neu.cs12$orig.ident <- "xu.neu.cs12"
+xu.neu.cs13$orig.ident <- "xu.neu.cs13"
+xu.neu.cs15$orig.ident <- "xu.neu.cs15"
+
+ray.neu.cs12$orig.ident <- "ray.neu.cs12"
+ray.neu.cs14$orig.ident <- "ray.neu.cs14"
+ray.neu.cs17$orig.ident <- "ray.neu.cs17"
+ray.neu.cs19$orig.ident <- "ray.neu.cs19"
+```
+
+```{r}
+neus <- merge(x=em.neu.d4,
+              y=list(em.neu.d6,em.neu.d9,em.neu.d9_2,em.neu.d23,em.neu.d35,
+                     ze.neu.cs10,ze.neu.cs12,ze.neu.cs13,xu.neu.cs12,xu.neu.cs13,xu.neu.cs15,
+                     ray.neu.cs12,ray.neu.cs14,ray.neu.cs19))
+
+neus <- JoinLayers(neus)
+neus <- CreateSeuratObject(counts=LayerData(neus, assay = "RNA", layer = "counts"), meta.data=neus@meta.data)
+neus[["RNA"]] <- split(neus[["RNA"]], f = neus$orig.ident)
+neus[["percent.mt"]] <- PercentageFeatureSet(neus, pattern = "^MT-")
+```
+
+```{r}
+neus <- NormalizeData(neus)
+```
+
+```{r}
+neus.pb <- AggregateExpression(neus, 
+                              assays = "RNA", 
+                              return.seurat = T, 
+                              group.by = c("orig.ident"),
+                              add.ident = NULL,
+                              normalization.method = "LogNormalize",
+                              scale.factor = 10000,
+                              verbose = TRUE)
+```
+
+```{r}
+features <- read_tsv("2024-A-hg38/genes.tsv")
+auto <- features %>% filter(chromosome %in% paste0("chr",seq(1,22)))
+```
+
+```{r}
+vivo <- neus %>% subset(subset = orig.ident %in% c("ze.neu.cs10","ze.neu.cs12","ze.neu.cs13","xu.neu.cs12","xu.neu.cs13","xu.neu.cs15","ray.neu.cs12","ray.neu.cs14","ray.neu.cs19"))
+vivo <- JoinLayers(vivo)
+vivo <- CreateSeuratObject(counts=LayerData(vivo, assay = "RNA", layer = "counts"), meta.data=vivo@meta.data)
+vivo <- vivo %>% subset(features = auto$gene_name)
+vivo <- NormalizeData(vivo)
+VariableFeatures(vivo)
+```
+
+```{r}
+all.genes <- rownames(neus.pb)
+neus.pb <- ScaleData(neus.pb, features=all.genes)
+
+neus.df <- LayerData(neus.pb,layer="scale.data") %>%
+  as_tibble() %>%
+  mutate(Genes=Features(neus.pb)) %>% 
+  dplyr::select(Genes,everything())
+```
+
+```{r}
+vivo <- FindVariableFeatures(vivo,nfeatures = 2000)
+
+pca <- neus.df %>% 
+  filter(Genes %in% VariableFeatures(vivo)) %>% 
+  column_to_rownames("Genes") %>% 
+  t() %>% 
+  prcomp()
+
+summary(pca)
+```
+
+```{r}
+pcd <- tibble(
+  orig.ident = c("em.neu.d4","em.neu.d6","em.neu.d9","em.neu.d23","em.neu.d35","ze.neu.cs10","ze.neu.cs12","ze.neu.cs13","xu.neu.cs12","xu.neu.cs13","xu.neu.cs15","ray.neu.cs12","ray.neu.cs14","ray.neu.cs17","ray.neu.cs19"),
+  pseudo.day = c(18, 20, 23, 37, 49, 22.5, 27, 30, 27, 30, 36, 27, 32, 41, 48)
+)
+
+pca.df <- pca$x %>% 
+  as_tibble() %>% 
+  mutate(orig.ident=rownames(pca$x)) %>% 
+  select(orig.ident,everything()) %>% 
+  left_join(pcd)
+
+corr.vivo <- rcorr(as.matrix(pca.df %>% filter(orig.ident %in% c("ze.neu.cs10","ze.neu.cs12","ze.neu.cs13","xu.neu.cs12","xu.neu.cs13","xu.neu.cs15","ray.neu.cs12","ray.neu.cs14","ray.neu.cs17","ray.neu.cs19")) %>% select(-orig.ident)))
+corr <- rcorr(as.matrix(pca.df %>% select(-orig.ident)))
+
+corr.vivo.df <- tibble(
+  dataset = "Vivo",
+  PC=rownames(corr.vivo$r),
+  R=corr.vivo$r[,"pseudo.day"],
+  Pval=corr.vivo$P[,"pseudo.day"]
+) %>% 
+  filter(PC %not.in% c("pseudo.day"))
+
+corr.df <- tibble(
+  dataset = "Vivo+Vitro",
+  PC=rownames(corr$r),
+  R=corr$r[,"pseudo.day"],
+  Pval=corr$P[,"pseudo.day"]
+) %>% 
+  filter(PC %not.in% c("pseudo.day"))
+
+cor.df <- bind_rows(corr.vivo.df,corr.df) %>% 
+  mutate(logP=-log10(Pval))
+
+g <- cor.df %>% 
+  ggplot(aes(x=PC,y=dataset,size=logP,color=R))
+p <- g + 
+  geom_point(shape=16) + 
+  theme_classic() + 
+  theme(
+    axis.title.y = element_blank(),
+  ) + 
+  scale_color_gradientn(colors=c("#303F9F","white","#C2185B")) + 
+  scale_y_discrete(limits=rev)
+p
+
+g <- corr.vivo.df %>% 
+  mutate(logP=-log10(Pval)) %>% 
+  mutate(PC=fct_relevel(as_factor(PC),paste0("PC",seq(1,10)))) %>% 
+  arrange(PC) %>% 
+  filter(PC %in% paste0("PC",seq(1,10))) %>% 
+  ggplot(aes(x=PC,y=dataset,size=logP,color=R))
+p <- g + 
+  geom_point(shape=16) + 
+  theme_classic() + 
+  theme(
+    axis.title.y = element_blank(),
+  ) + 
+  scale_color_gradientn(colors=c("#303F9F","white","#C2185B")) + 
+  scale_y_discrete(limits=rev)
+p
+```
+
+```{r}
+pca.df <- pca.df %>% 
+  mutate(dataset=ifelse(orig.ident %in% c("ze.neu.cs10","ze.neu.cs12","ze.neu.cs13","xu.neu.cs12","xu.neu.cs13","xu.neu.cs15","ray.neu.cs12","ray.neu.cs14","ray.neu.cs17","ray.neu.cs19"),"Vivo","Vitro"))
+
+g <- pca.df %>% 
+  ggplot(aes(x=PC1,y=PC2,color=pseudo.day,shape=dataset,text=orig.ident))
+p <- g + 
+  geom_point(size=5) + 
+  theme_classic() + 
+  theme(
+    aspect.ratio = 1/4,
+  ) + 
+  scale_color_gradientn(colors=rev(viridis_pal(option="mako")(12)[2:10])) + 
+  scale_shape_manual(values=c(18,16)) + 
+  scale_x_reverse() + 
+  scale_y_continuous(expand=c(0.5,0.5))
+p
+
+ggsave(plot=p, filename="SpinalCord/PCA1-2.svg",
+       width=5, height=3, limitsize = FALSE)
+```
+

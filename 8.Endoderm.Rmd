@@ -1,0 +1,203 @@
+---
+title: "Endoderm"
+output: html_notebook
+---
+
+# Library
+```{r}
+library(tidyverse)
+library(data.table)
+library(lemon)
+library(Seurat)
+library(SeuratWrappers)
+library(ggsci)
+library(viridis)
+library(amap)
+library(directlabels)
+library(scCustomize)
+
+"%not.in%" <- Negate("%in%")
+
+mypal <- c(pal_jco("default")(10),
+           pal_startrek("uniform")(7),
+           pal_flatui("default")(10),
+           pal_frontiers("default")(10),
+           pal_cosmic("hallmarks_light")(10),
+           pal_npg("nrc")(10),
+           pal_aaas("default")(10),
+           pal_nejm("default")(8),
+           pal_lancet("lanonc")(9),
+           pal_ucscgb("default")(26),
+           pal_d3("category20")(20),
+           pal_observable("observable10")(10),
+           pal_igv("default")(51),
+           pal_rickandmorty("schwifty")(12)) %>% unlist() %>% unique()
+```
+
+# Load Data
+```{r}
+lem <- readRDS("D9-35.rds")
+
+end <- subset(lem, subset = Annotation_Level1 %in% c("End"))
+end <- CreateSeuratObject(counts=LayerData(end, assay = "RNA", layer = "counts"), meta.data=end@meta.data)
+end[["RNA"]] <- split(end[["RNA"]], f = end$Day)
+
+end <- NormalizeData(end)
+end <- FindVariableFeatures(end,nfeatures = 3000)
+end <- ScaleData(end, vars.to.regress = c("nCount_RNA","percent.mt","S.Score","G2M.Score"))
+end <- RunPCA(end)
+```
+
+# Harmony integration
+```{r}
+end.i <- IntegrateLayers(
+  object = end, method = HarmonyIntegration, assay = "RNA",theta=0.8,
+  orig.reduction = "pca", new.reduction = "harmony", verbose = FALSE)
+```
+
+```{r}
+dim <- 50
+k <- 50
+mind <- 0.3
+
+end.i <- RunUMAP(end.i,
+                dims = 1:dim, 
+                reduction = "harmony",
+                reduction.name = "umap.harmony", 
+                n.neighbors = k,
+                min.dist = mind, 
+                spread=0.5,
+                metric = "manhattan")
+```
+
+# Clustering
+```{r}
+end.i <- FindNeighbors(end.i, reduction = "harmony", dims = 1:20, k.param = 20, nn.method = "annoy", annoy.metric = "manhattan")
+end.i <- FindClusters(end.i, resolution = 0.2, cluster.name = "harmony_clusters", nn.method = "annoy", annoy.metric = "manhattan")
+```
+
+# FindaMarkers
+```{r}
+end.i <- JoinLayers(end.i)
+
+markers <- FindAllMarkers(end.i, only.pos = TRUE)
+
+markers %>% 
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  top_n(p_val_adj,n=-20)
+
+markers %>% 
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  filter(p_val_adj < 0.05) %>% 
+  write_tsv("Level2/Endoderm_culsters_markers.txt")
+```
+
+```{r}
+anno <- read_tsv("Level2/Endoderm_culsters_annotation.txt")
+
+meta <- end.i@meta.data
+meta <- meta %>% left_join(anno)
+meta <- meta %>% select(Clusters_Level2,Annotation_Level2,Color_Level2)
+end.i <- AddMetaData(end.i, metadata=meta)
+
+saveRDS(end.i,"Level2/Endoderm.rds")
+```
+
+# Plot
+## Day
+```{r}
+pal <- c(viridis_pal(option="magma")(12)[c(11,8,6)])
+
+g <- bind_cols(end.i@meta.data,end.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,color=Day))
+p <- g +
+  geom_point(shape=16,size=3) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_manual(values=pal)
+p
+ggsave(plot=p, filename="Plot/Endoderm_Day.png",
+       width=6, height=6, limitsize = FALSE)
+```
+
+## Annotation
+```{r}
+g <- bind_cols(end.i@meta.data,end.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=Color_Level2))
+p <- g +
+  geom_point(shape=16,size=3) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_identity()
+p
+ggsave(plot=p, filename="Level2/Plot/Endoderm_lvl2.png",
+       width=6, height=6, limitsize = FALSE)
+```
+
+## Dot Plot
+```{r}
+level_order <- c("C5","C2","C1","C6","C4","C0","C3","C9","C8","C7")
+
+selected <- read_tsv("Level2/Endoderm_culsters_markers_selected.txt")
+
+end@meta.data <- end@meta.data %>% 
+  dplyr::mutate(Clusters_Level2=fct_relevel(as_factor(Clusters_Level2),level_order))
+
+p <- DotPlot(subset(end, subset = Clusters_Level2 %not.in% c("C7")), 
+             features = unique(c("FOXA2","CLDN4","CDX2","SOX2",selected$gene)), group.by = "Clusters_Level2") & 
+  scale_color_gradientn(colors=rev(viridis_pal(option="rocket")(15)[6:15])) &
+  scale_y_discrete(limits=rev) & 
+  scale_x_discrete() & 
+  theme(
+    axis.text.x = element_text(angle = 90,hjust=1,vjust=0.5)
+  )
+p
+
+ggsave(plot=p, filename="Level2/Plot/Endoderm_Marker.2.svg",
+       width=9, height=3, limitsize = FALSE)
+```
+
+## Feature Plot
+```{r}
+pal <- rev(viridis_pal(option="rocket")(15)[6:15])
+markers <- read_tsv("Level2/Endoderm_culsters_markers_selected.txt")
+
+genes <- markers$gene %>% unique()
+genes <- na.omit(genes)
+
+genes <- c(genes,"FOXA2","CLDN4","CDX2","SOX2")
+
+for(i in 1:length(genes)){
+  mark <- genes[i]
+  p <- FeaturePlot_scCustom(seurat_object = end, num_columns = 1, label = F,
+                            features = genes[i], colors_use = pal, na_color = "grey90",
+                            reduction = "umap.harmony", order=TRUE, pt.size = 3) & 
+    theme_void() & 
+    theme(
+      legend.position = "none",
+      aspect.ratio = 1,
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.line = element_blank(),
+      axis.ticks = element_blank(),
+      plot.title = element_blank()
+      )
+  
+  ggsave(plot=p, 
+         filename=paste0("Level2/Plot/Endoderm_features/",i,".",mark,".png"),
+         width=5, height=5, limitsize = FALSE)
+}
+
+```
+
+

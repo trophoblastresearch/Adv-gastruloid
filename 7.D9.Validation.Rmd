@@ -1,0 +1,240 @@
+---
+title: "Day9 validation"
+output: html_notebook
+---
+
+
+# Library
+```{r}
+library(tidyverse)
+library(data.table)
+library(lemon)
+library(Seurat)
+library(SeuratWrappers)
+library(ggsci)
+library(viridis)
+library(RColorBrewer)
+library(scCustomize)
+
+"%not.in%" <- Negate("%in%")
+
+mypal <- c(pal_jco("default")(10),
+           pal_startrek("uniform")(7),
+           pal_flatui("default")(10),
+           pal_frontiers("default")(10),
+           pal_cosmic("hallmarks_light")(10),
+           pal_npg("nrc")(10),
+           pal_aaas("default")(10),
+           pal_nejm("default")(8),
+           pal_lancet("lanonc")(9),
+           pal_ucscgb("default")(26),
+           pal_d3("category20")(20),
+           pal_observable("observable10")(10),
+           pal_igv("default")(51),
+           pal_rickandmorty("schwifty")(12)) %>% unlist() %>% unique()
+
+pal <- viridis(n = 10, option = "D")
+```
+
+# Load Data
+```{r}
+em.d9 <- readRDS("/Users/asekiya/Desktop/Dry/Running/7_EmbryoModel/scRNA-seq/Result_v13/RDS/D9.Combi.rds")
+em.d9[["RNA"]] <- split(em.d9[["RNA"]], f = em.d9$batch)
+em.d9@meta.data %>% group_by(orig.ident) %>% summarise(Count=n())
+```
+
+# DownSample
+```{r}
+set.seed(0)
+Idents(em.d9) <- "orig.ident"
+em.d9.down <- subset(em.d9, downsample = 4000)
+em.d9.down@meta.data %>% group_by(orig.ident) %>% summarise(Count=n())
+em.d9
+```
+
+# Normalization ~ PCA
+```{r}
+em.d9.down <- NormalizeData(em.d9.down)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+em.d9.down.cc <- JoinLayers(em.d9.down)
+em.d9.down.cc <- CellCycleScoring(em.d9.down.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = em.d9.down.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(em.d9.down.cc)
+
+em.d9.down <- AddMetaData(em.d9.down, metadata = cc.score)
+
+em.d9.down <- FindVariableFeatures(em.d9.down,nfeatures = 2000)
+em.d9.down <- ScaleData(em.d9.down, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+em.d9.down <- RunPCA(em.d9.down)
+```
+
+# Integration
+```{r}
+em.d9.i <- IntegrateLayers(
+  object = em.d9.down, method = HarmonyIntegration, assay = "RNA",
+  orig.reduction = "pca", new.reduction = "harmony", verbose = FALSE)
+```
+
+```{r}
+dim <- 50
+k <- 30
+mind <- 0.3
+
+em.d9.i <- RunUMAP(em.d9.i,
+                  dims = 1:dim, 
+                  reduction = "harmony",
+                  reduction.name = "umap.harmony", 
+                  n.neighbors = k,
+                  min.dist = 0.3, 
+                  spread=0.5,
+                  metric = "manhattan")
+
+p <- DimPlot(em.d9.i, group.by = c("orig.ident"),label = T,reduction = "umap.harmony") &
+  theme_classic() & 
+  theme(
+      aspect.ratio = 1,
+      plot.title = element_blank(),
+      legend.position = "none"
+    ) &
+  scale_color_manual(values=mypal) & 
+  guides(colour = guide_legend(override.aes = list(size=4))) & 
+  xlab("UMAP_1") & 
+  ylab("UMAP_2")
+p
+```
+
+# Clustering
+```{r}
+em.d9.i <- FindNeighbors(em.d9.i, reduction = "harmony", dims = 1:50, k.param = 5, nn.method = "annoy", annoy.metric = "manhattan")
+em.d9.i <- FindClusters(em.d9.i, resolution = 0.15, cluster.name = "harmony_clusters", nn.method = "annoy", annoy.metric = "manhattan")
+
+DimPlot(em.d9.i, group.by = c("harmony_clusters"),label = TRUE,reduction = "umap.harmony",
+        label.size = 7, pt.size = 1) &
+  theme_classic() & 
+  theme(
+      aspect.ratio = 1,
+      legend.position = "none"
+    ) &
+  scale_color_manual(values=mypal) &
+  guides(colour = guide_legend(override.aes = list(size=4)))
+```
+
+# Marker
+```{r}
+em.d9.i <- JoinLayers(em.d9.i)
+
+markers <- FindAllMarkers(em.d9.i, only.pos = TRUE)
+
+markers %>% 
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  filter(p_val_adj < 0.05) %>% 
+  write_tsv("Day9_combi/Cluster_Markers.txt")
+```
+# Annotation
+```{r}
+anno <- tibble(harmony_clusters=c("0","1","2","3","4","5","6","7","8","9","10","11"),
+       Annotation=c("Mesoderm","Mesoderm","Neural prog.","Endoderm","Mesoderm","Mesoderm","Neural crest","Card.Meso","Neuron","Mesothelium","Undefined","Endothelium"))
+
+meta <- tibble(
+  cells=Cells(em.d9.i),
+  harmony_clusters=em.d9.i$harmony_clusters,
+) %>% left_join(anno) %>% 
+  column_to_rownames("cells")
+
+em.d9.i <- em.d9.i %>% AddMetaData(metadata = meta)
+```
+
+# Plot
+## Combination
+```{r}
+g <- bind_cols(em.d9.i@meta.data,em.d9.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.ident=fct_relevel(as_factor(orig.ident),c("EM_5x2_Day9","EM_ix2_Day9","EM_5x5_Day9"))) %>% 
+  mutate(Annotation=fct_relevel(Annotation,c("Endoderm","Mesoderm","Mesothelium","Card.Meso","Endothelium","Neural prog.","Neuron","Neural crest","Undefined"))) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=orig.ident))
+p <- g +
+  geom_point(shape=16,size=0.8) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_manual(values=colors_discrete_seaside[1:3])
+p
+ggsave(plot=p, filename="Plot/Day9_Combi.png",
+       width=3, height=3, limitsize = FALSE)
+```
+
+## Annotation
+```{r}
+g <- bind_cols(em.d9.i@meta.data,em.d9.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  sample_frac(size=1) %>% 
+  mutate(orig.ident=fct_relevel(as_factor(orig.ident),c("EM_5x2_Day9","EM_ix2_Day9","EM_5x5_Day9"))) %>% 
+  mutate(Annotation=fct_relevel(Annotation,c("Endoderm","Mesoderm","Mesothelium","Card.Meso","Endothelium","Neural prog.","Neuron","Neural crest","Undefined"))) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=Annotation))
+p <- g +
+  geom_point(shape=16,size=0.8) +
+  theme_void() + 
+  theme(
+    legend.position = "none",
+    aspect.ratio = 1) +
+  scale_color_manual(values=c(mypal[50:57],"grey90"))
+p
+ggsave(plot=p, filename="Plot/Day9_Annotation.png",
+       width=3, height=3, limitsize = FALSE)
+```
+
+## Proportion
+```{r}
+dat <- em.d9.i@meta.data %>% 
+  as_tibble() %>% 
+  group_by(orig.ident,Annotation) %>% 
+  summarise(Count=n()) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = orig.ident, values_from = Count, values_fill = 0) %>% 
+  pivot_longer(-1, names_to = "orig.ident", values_to = "Count") %>% 
+  filter(Annotation %not.in% c("Undefined")) %>% 
+  group_by(orig.ident) %>% 
+  mutate(Total=sum(Count)) %>% 
+  mutate(Percent=(Count/Total)*100) %>% 
+  arrange(orig.ident) %>% 
+  ungroup() %>% 
+  mutate(orig.ident=fct_relevel(as_factor(orig.ident),c("EM_5x2_Day9","EM_ix2_Day9","EM_5x5_Day9"))) %>% 
+  mutate(Annotation=fct_relevel(Annotation,c("Endoderm","Mesoderm","Mesothelium","Card.Meso","Endothelium","Neural prog.","Neuron","Neural crest")))
+
+g <- dat %>% 
+  ggplot(aes(x=orig.ident,y=Percent))
+p <- g + 
+  geom_flow(aes(alluvium = Annotation),
+            alpha= .9, 
+            lty = 2, fill = "white", color = "black",
+            curve_type = "linear", 
+            width = .66) +
+  geom_col(aes(fill = Annotation), width = .66, color = "black") +
+  scale_fill_manual(values=mypal[50:length(mypal)]) +
+  scale_y_reverse(expand = c(0,0)) + 
+  theme_classic() + 
+  theme(
+    panel.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour="black"),
+    axis.line.y = element_blank(),
+    axis.title.y = element_text(size=15),
+    axis.title.x = element_blank(),
+    axis.text = element_text(colour="black"),
+    aspect.ratio = 1/2.8,
+    legend.position = "none"
+  ) + 
+  coord_flip()
+p
+ggsave(plot=p, filename="Plot/Day9_Anno.Percent.svg",
+       width=6, height=3, limitsize = FALSE)
+```
+
+

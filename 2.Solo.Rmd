@@ -1,0 +1,354 @@
+---
+title: "Co-culture vs Solo-culture"
+output: html_notebook
+---
+
+# Library
+```{r}
+library(tidyverse)
+library(data.table)
+library(lemon)
+library(Seurat)
+library(SeuratWrappers)
+library(ggsci)
+library(viridis)
+library(RColorBrewer)
+library(scCustomize)
+
+"%not.in%" <- Negate("%in%")
+
+mypal <- c(pal_jco("default")(10),
+           pal_startrek("uniform")(7),
+           pal_flatui("default")(10),
+           pal_frontiers("default")(10),
+           pal_cosmic("hallmarks_light")(10),
+           pal_npg("nrc")(10),
+           pal_aaas("default")(10),
+           pal_nejm("default")(8),
+           pal_lancet("lanonc")(9),
+           pal_ucscgb("default")(26),
+           pal_d3("category20")(20),
+           pal_observable("observable10")(10),
+           pal_igv("default")(51),
+           pal_rickandmorty("schwifty")(12)) %>% unlist() %>% unique()
+
+pal <- viridis(n = 10, option = "D")
+```
+
+# Load data
+```{r}
+eem <- readRDS("D0-6.rds")
+
+colmap <- tibble(
+  Annotation = eem$Annotation %>% unique() %>% sort(),
+  Annotation.color = mypal[1:21]
+)
+
+meta <- tibble(
+  cells = Cells(eem),
+  Annotation = eem$Annotation
+) %>% 
+  left_join(colmap) %>% 
+  select(cells,Annotation.color) %>% 
+  column_to_rownames("cells")
+
+eem <- eem %>% AddMetaData(metadata = meta)
+
+eem3 <- eem %>% subset(subset = Day %in% c(0,1,2,3))
+```
+
+```{r}
+solo <- readRDS("Solo.rds")
+
+nam <- tibble(
+  day = solo$Day,
+  cells = Cells(solo)
+) %>% 
+  mutate(new.id=paste0("solo.D",day))
+
+solo <- RenameCells(solo, nam$new.id)
+```
+
+# PSCs
+## Merge
+```{r}
+early <- merge(x=eem3,y=solo)
+early <- JoinLayers(early)
+
+es <- CreateSeuratObject(counts=LayerData(early, assay = "RNA", layer = "counts"), meta.data=early@meta.data) %>% subset(subset = Origin.cell.type %in% c("PSC"))
+es[["RNA"]] <- split(es[["RNA"]], f = es$batch)
+```
+
+## Normalization ~ PCA
+```{r}
+es <- NormalizeData(es)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+es.cc <- JoinLayers(es)
+es.cc <- CellCycleScoring(es.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = es.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(es.cc)
+
+es <- AddMetaData(es, metadata = cc.score)
+
+es <- FindVariableFeatures(es,nfeatures = 3000)
+es <- ScaleData(es, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+es <- RunPCA(es)
+```
+
+## Harmony integration
+```{r}
+set.seed(0)
+es.i <- IntegrateLayers(
+  object = es, method = HarmonyIntegration, assay = "RNA",
+  theta = 2, lambda = 100,
+  orig.reduction = "pca", new.reduction = "harmony", verbose = FALSE)
+```
+
+```{r}
+dim <- 30
+k <- 5
+mind <- 0.4
+
+es.i <- RunUMAP(es.i,
+                  dims = 1:dim, 
+                  reduction = "harmony",
+                  reduction.name = "umap.harmony", 
+                  n.neighbors = k,
+                  min.dist = mind, 
+                  spread=0.5,
+                  metric = "manhattan")
+```
+
+## Plot
+### Day
+```{r}
+g <- bind_cols(es.i@meta.data,es.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  mutate(Day=ifelse(!is.na(Day),Day,"Unassigned")) %>% 
+  arrange(desc(Day)) %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=Day,shape=batch))
+p <- g +
+  geom_point(size=2,fill="white") +
+  theme_void() +
+  theme(aspect.ratio = 1,
+        legend.position = "none") +
+  scale_color_manual(values=c(viridis_pal(option="inferno")(12)[c(1,4,6,8)],"grey90")) + 
+  scale_shape_manual(values=c(15,16,21)) + 
+  guides(colour = guide_legend(override.aes = list(size=4)))
+p
+
+ggsave(plot=p, 
+       filename=paste0("SoloCulture/","PSC.Day.png"), 
+       width=6, height=6, limitsize = FALSE)
+```
+
+### Annotation
+```{r}
+g <- bind_cols(es.i@meta.data,es.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  mutate(Annotation.color=ifelse(Annotation %in% c("PSC","PS","Noto","LP.Meso-1","LP.Meso-2","EXE.Meso","LP.Meso-3","Endothelium","Endo-1","Endo-2"),Annotation.color,"grey60")) %>% 
+  arrange(desc(Day)) %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,color=Annotation.color,shape=batch))
+p <- g +
+  geom_point(size=2,fill="grey90") +
+  theme_void() +
+  theme(aspect.ratio = 1,
+        legend.position = "none") +
+  scale_color_identity() + 
+  scale_shape_manual(values=c(16,16,21)) + 
+  guides(colour = guide_legend(override.aes = list(size=4)))
+p
+
+ggsave(plot=p, 
+       filename=paste0("SoloCulture/","PSC.Annot.png"), 
+       width=6, height=6, limitsize = FALSE)
+```
+
+# NMLCs
+## Merge
+```{r}
+early <- merge(x=eem3,y=solo)
+early <- JoinLayers(early)
+
+nm <- CreateSeuratObject(counts=LayerData(early, assay = "RNA", layer = "counts"), meta.data=early@meta.data) %>% subset(subset = Origin.cell.type %in% c("PSC"))
+nm[["RNA"]] <- split(nm[["RNA"]], f = nm$batch)
+```
+
+## Normalization ~ PCA
+```{r}
+nm <- NormalizeData(nm)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+nm.cc <- JoinLayers(nm)
+nm.cc <- CellCycleScoring(nm.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = nm.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(nm.cc)
+
+nm <- AddMetaData(nm, metadata = cc.score)
+
+nm <- FindVariableFeatures(nm,nfeatures = 3000)
+nm <- ScaleData(nm, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+nm <- RunPCA(nm)
+```
+
+## Harmony integration
+```{r}
+set.seed(0)
+nm.i <- IntegrateLayers(
+  object = nm, method = HarmonyIntegration, assay = "RNA",
+  theta = 2, lambda = 100,
+  orig.reduction = "pca", new.reduction = "harmony", verbose = FALSE)
+```
+
+```{r}
+dim <- 30
+k <- 5
+mind <- 0.4
+
+nm.i <- RunUMAP(nm.i,
+                  dims = 1:dim, 
+                  reduction = "harmony",
+                  reduction.name = "umap.harmony", 
+                  n.neighbors = k,
+                  min.dist = mind, 
+                  spread=0.5,
+                  metric = "manhattan")
+```
+
+## Plot
+### Day
+```{r}
+g <- bind_cols(nm.i@meta.data,nm.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  mutate(Day=ifelse(!is.na(Day),Day,"Unassigned")) %>% 
+  arrange(desc(Day)) %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,colour=Day,shape=batch))
+p <- g +
+  geom_point(size=2,fill="white") +
+  theme_void() +
+  theme(aspect.ratio = 1,
+        legend.position = "none") +
+  scale_color_manual(values=c(viridis_pal(option="inferno")(12)[c(1,4,6,8)],"grey90")) + 
+  scale_shape_manual(values=c(15,16,21)) + 
+  guides(colour = guide_legend(override.aes = list(size=4)))
+p
+
+ggsave(plot=p, 
+       filename=paste0("SoloCulture/","NMLC.Day.png"), 
+       width=6, height=6, limitsize = FALSE)
+```
+
+### Annotation
+```{r}
+g <- bind_cols(nm.i@meta.data,nm.i@reductions$umap.harmony@cell.embeddings) %>% 
+  as_tibble() %>% 
+  mutate(Annotation.color=ifelse(Annotation %in% c("NMLC","NMP-N","NMP-M","pPSM","aPSM","Somite","Inter.Meso","SC-1","SC-2","SC-3"),Annotation.color,"grey60")) %>% 
+  arrange(desc(Day)) %>% 
+  sample_frac(size=1) %>% 
+  ggplot(aes(x=umapharmony_1,y=umapharmony_2,color=Annotation.color,shape=batch))
+p <- g +
+  geom_point(size=2,fill="grey90") +
+  theme_void() +
+  theme(aspect.ratio = 1,
+        legend.position = "none") +
+  scale_color_identity() + 
+  scale_shape_manual(values=c(16,16,21)) + 
+  guides(colour = guide_legend(override.aes = list(size=4)))
+p
+
+ggsave(plot=p, 
+       filename=paste0("SoloCulture/","NMLC.Annot.png"), 
+       width=6, height=6, limitsize = FALSE)
+```
+
+# PSC & NMLC
+```{r}
+early <- merge(x=eem3,y=solo)
+early <- JoinLayers(early)
+
+early <- CreateSeuratObject(counts=LayerData(early, assay = "RNA", layer = "counts"), meta.data=early@meta.data)
+early[["RNA"]] <- split(early[["RNA"]], f = early$batch)
+```
+
+```{r}
+early@meta.data %>% group_by(orig.ident) %>% summarise(n())
+```
+
+## Normalization ~ PCA
+```{r}
+early <- NormalizeData(early)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+early.cc <- JoinLayers(early)
+early.cc <- CellCycleScoring(early.cc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+cc.score <- FetchData(object = early.cc, vars = c("S.Score", "G2M.Score","Phase"))
+rm(early.cc)
+
+early <- AddMetaData(early, metadata = cc.score)
+
+early <- FindVariableFeatures(early,nfeatures = 3000)
+early <- ScaleData(early, vars.to.regress = c("nCount_RNA","percent.mt","S.Score", "G2M.Score"))
+early <- RunPCA(early)
+```
+
+## VlnPlot
+```{r}
+genes <- c("UTF1", "NANOG", "SOX2", "POU5F1", "EOMES", "MESP1", "GSC", "NOTO", "CHRD", "SHH", "LHX1", "ALPK2", "LGR5", "LIX1", "HAND1", "FOXF1", "GATA4", "TBX5", "HAND2", "LUM", "POSTN", "AQP1", "BST2", "CDH5", "TAL1","CD34", "ICAM2", "CD93", "MOBP", "RUNX1", "SOX17", "FOXA2", "APOA1", "APOA2", "HNF4A", "CLDN4", "DKK1", "FGF8", "TBXT", "NKX1-2", "MIXL1", "WNT3A", "HES7", "WNT8A", "MSGN1", "TBX6", "CITED1", "FGF3", "RIPPLY2", "MESP2", "DKK1", "TCF15", "FGF18", "FOXC2", "MEOX1", "FGF18", "RIPPLY1", "MEOX2", "MOXD1", "WT1", "PAX2", "PAX8", "EMX2", "CA4", "SOX3", "HES5", "RFX4", "SOX1", "NEUROG1", "NEUROD1")
+
+dat <- FetchData(early, layer = "data", vars=c(genes,names(early@meta.data))) %>% 
+  mutate(dataset = ifelse(batch=="day1-6","Co-culture","Solo")) %>% 
+  mutate(dataset = fct_relevel(as_factor(dataset),c("Solo","Co-culture")))
+
+for(gene in genes){
+  gene.dat <- dat %>% select(all_of(gene),dataset,Origin.cell.type,Day)
+  colnames(gene.dat) <- c("gene","dataset","Origin.cell.type","Day")
+  
+  g <- gene.dat %>% 
+    ggplot(aes(x=Day, y= gene, fill=dataset, color=dataset))
+  p <- g + 
+    geom_violin(scale = "width",position = position_dodge(width = 0.8), width = 0.7, linewidth=0.2) + 
+    geom_point(alpha=0.6, size=1, shape=21, stroke = 0.2, fill=NA, position = position_jitterdodge(dodge.width = 0.8, jitter.width = 0.3)) + 
+    facet_rep_grid(.~Origin.cell.type,repeat.tick.labels = F, scales = "free_x", space = "free_x",switch = "x") + 
+    scale_color_manual(values = c("#546E7A","#F4511E")) + 
+    scale_fill_manual(values = c("#CFD8DC","#FFCCBC")) + 
+    theme_classic() +
+    theme(
+      panel.grid.major.y = element_line(color="grey90",linewidth = 0.1),
+      panel.grid.minor.y = element_blank(),
+      axis.line = element_line(linewidth = 0.1),
+      axis.ticks.x = element_line(linewidth = 0.2),
+      axis.ticks.y = element_blank(),
+      axis.title = element_blank(),
+      axis.title.x = element_blank(),
+      axis.text.y = element_blank(),
+      axis.text.x = element_text(color="black",size=10),
+      strip.text = element_text(color="black",size=13),
+      legend.position = "none",
+      strip.background = element_blank(),
+      strip.placement = "outside",
+    ) + 
+    ylab(gene)
+  
+  p
+  
+  ggsave(plot=p,
+         filename=paste0("SoloCulture/Vln/",gene,".svg"),
+         height=1.6, width=5, limitsize = FALSE)
+  
+}
+```
+
+
+
+
+
