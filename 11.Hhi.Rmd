@@ -45,7 +45,7 @@ mypal <- c(pal_jco("default")(10),
 
 # Load data
 ```{r}
-hhi <- readRDS("/Users/asekiya/Desktop/Dry/Running/7_EmbryoModel/scRNA-seq/Result_v13/RDS/D9.Hhi.rds")
+hhi <- readRDS("D9.Hhi.rds")
 hhi[["RNA"]] <- split(hhi[["RNA"]], f = hhi$batch)
 ```
 
